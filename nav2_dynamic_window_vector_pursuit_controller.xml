@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<library path="nav2_dynamic_window_vector_pursuit_controller">
+  <class
+    type="nav2_dynamic_window_vector_pursuit_controller::DynamicWindowVectorPursuitController"
+    base_class_type="nav2_core::Controller">
+    <description>
+      Dynamic Window Vector Pursuit controller plugin for omnidirectional robots
+    </description>
+  </class>
+</library>
