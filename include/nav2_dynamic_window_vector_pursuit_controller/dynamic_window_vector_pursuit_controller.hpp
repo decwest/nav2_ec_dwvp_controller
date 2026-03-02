@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <fstream>
 #include <string>
 #include <tuple>
 
@@ -39,6 +40,7 @@ public:
     const geometry_msgs::msg::PoseStamped & pose,
     const geometry_msgs::msg::Twist & speed,
     nav2_core::GoalChecker * goal_checker) override;
+  void setPlan(const nav_msgs::msg::Path & path) override;
 
   void activate() override;
   void deactivate() override;
@@ -91,6 +93,22 @@ protected:
     const geometry_msgs::msg::Twist & next_cmd_vel,
     const geometry_msgs::msg::Twist & current_cmd_vel) const;
 
+  void openNewCsvLogFile(const rclcpp::Time & stamp);
+  void closeCsvLogFile();
+  void writeCsvLogLine(
+    const rclcpp::Time & stamp,
+    const geometry_msgs::msg::PoseStamped & pose,
+    const geometry_msgs::msg::Twist & speed,
+    const geometry_msgs::msg::Twist & feedback_speed,
+    const geometry_msgs::msg::Twist & cmd_velocity,
+    const DynamicWindowBounds3D & dynamic_window,
+    double curvature,
+    double regulated_speed,
+    double lookahead_dist,
+    double lookahead_yaw,
+    bool is_accel,
+    bool constraints_violation);
+
   double max_vel_x_ {0.6};
   double min_vel_x_ {-0.6};
   double max_vel_y_ {0.6};
@@ -105,6 +123,12 @@ protected:
   std::string velocity_feedback_ {"OPEN_LOOP"};
   bool use_dynamic_window_vector_pursuit_ {true};
   bool use_collision_detection_for_omni_ {false};
+  bool enable_csv_logging_ {false};
+  std::string csv_log_directory_ {"/tmp"};
+  std::string csv_filename_prefix_ {"dwvp_log"};
+  bool csv_header_written_ {false};
+  std::ofstream csv_stream_;
+  geometry_msgs::msg::Twist last_command_velocity_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Bool>>
   constraints_violation_flag_pub_;
 };

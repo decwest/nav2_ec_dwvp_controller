@@ -12,14 +12,26 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <ctime>
+#include <filesystem>
+#include <iomanip>
 #include <limits>
+#include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "angles/angles.h"
+#include "ament_index_cpp/get_package_share_directory.hpp"
+#if __has_include("nav2_core/controller_exceptions.hpp")
 #include "nav2_core/controller_exceptions.hpp"
+#elif __has_include("nav2_core/exceptions.hpp")
+#include "nav2_core/exceptions.hpp"
+#else
+#error "Neither nav2_core/controller_exceptions.hpp nor nav2_core/exceptions.hpp was found."
+#endif
 #include "nav2_util/node_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -32,6 +44,33 @@ using nav2_util::declare_parameter_if_not_declared;
 
 namespace nav2_dynamic_window_vector_pursuit_controller
 {
+namespace
+{
+std::string getDefaultCsvLogDirectory(const rclcpp::Logger & logger)
+{
+  try {
+    const auto pkg_share =
+      ament_index_cpp::get_package_share_directory("nav2_dynamic_window_vector_pursuit_controller");
+    const auto log_dir = std::filesystem::path(pkg_share) / "data";
+    std::error_code ec;
+    std::filesystem::create_directories(log_dir, ec);
+    if (ec) {
+      RCLCPP_WARN(
+        logger,
+        "Failed to create default csv directory '%s' (%s). Falling back to /tmp.",
+        log_dir.string().c_str(), ec.message().c_str());
+      return "/tmp";
+    }
+    return log_dir.string();
+  } catch (const std::exception & e) {
+    RCLCPP_WARN(
+      logger,
+      "Failed to resolve package share for default csv directory (%s). Falling back to /tmp.",
+      e.what());
+    return "/tmp";
+  }
+}
+}  // namespace
 
 void DynamicWindowVectorPursuitController::configure(
   const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
@@ -46,6 +85,8 @@ void DynamicWindowVectorPursuitController::configure(
     throw std::runtime_error(
             "Failed to lock parent node in DynamicWindowVectorPursuitController::configure");
   }
+
+  const std::string default_csv_log_directory = getDefaultCsvLogDirectory(logger_);
 
   declare_parameter_if_not_declared(
     node.get(), name + ".max_vel_x",
@@ -89,6 +130,15 @@ void DynamicWindowVectorPursuitController::configure(
   declare_parameter_if_not_declared(
     node.get(), name + ".use_collision_detection_for_omni",
     rclcpp::ParameterValue(false));
+  declare_parameter_if_not_declared(
+    node.get(), name + ".enable_csv_logging",
+    rclcpp::ParameterValue(false));
+  declare_parameter_if_not_declared(
+    node.get(), name + ".csv_log_directory",
+    rclcpp::ParameterValue(default_csv_log_directory));
+  declare_parameter_if_not_declared(
+    node.get(), name + ".csv_filename_prefix",
+    rclcpp::ParameterValue(std::string("dwvp_log")));
 
   node->get_parameter(name + ".max_vel_x", max_vel_x_);
   node->get_parameter(name + ".min_vel_x", min_vel_x_);
@@ -104,6 +154,9 @@ void DynamicWindowVectorPursuitController::configure(
   node->get_parameter(name + ".velocity_feedback", velocity_feedback_);
   node->get_parameter(name + ".use_dynamic_window_vector_pursuit", use_dynamic_window_vector_pursuit_);
   node->get_parameter(name + ".use_collision_detection_for_omni", use_collision_detection_for_omni_);
+  node->get_parameter(name + ".enable_csv_logging", enable_csv_logging_);
+  node->get_parameter(name + ".csv_log_directory", csv_log_directory_);
+  node->get_parameter(name + ".csv_filename_prefix", csv_filename_prefix_);
 
   max_accel_x_ = std::max(1e-6, std::abs(max_accel_x_));
   max_accel_y_ = std::max(1e-6, std::abs(max_accel_y_));
@@ -115,13 +168,32 @@ void DynamicWindowVectorPursuitController::configure(
     velocity_feedback_.begin(), velocity_feedback_.end(), velocity_feedback_.begin(),
     [](const unsigned char c) {return static_cast<char>(std::toupper(c));});
 
-  if (params_->use_collision_detection && !use_collision_detection_for_omni_) {
+  if (use_collision_detection_ && !use_collision_detection_for_omni_) {
     RCLCPP_WARN(
       logger_,
       "Collision detection is enabled in RPP params, but DWVP omni collision checking is "
       "disabled by default. Set %s.use_collision_detection_for_omni:=true to enable approximate "
       "checking based on translational speed magnitude.",
       name.c_str());
+  }
+
+  if (enable_csv_logging_) {
+    if (csv_log_directory_.empty()) {
+      csv_log_directory_ = default_csv_log_directory;
+    }
+    if (csv_filename_prefix_.empty()) {
+      csv_filename_prefix_ = "dwvp_log";
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(csv_log_directory_, ec);
+    if (ec) {
+      RCLCPP_WARN(
+        logger_,
+        "Failed to create csv_log_directory '%s' (%s). Falling back to /tmp.",
+        csv_log_directory_.c_str(), ec.message().c_str());
+      csv_log_directory_ = "/tmp";
+      std::filesystem::create_directories(csv_log_directory_, ec);
+    }
   }
 
   constraints_violation_flag_pub_ =
@@ -139,6 +211,7 @@ void DynamicWindowVectorPursuitController::activate()
 void DynamicWindowVectorPursuitController::deactivate()
 {
   rpp::RegulatedPurePursuitController::deactivate();
+  closeCsvLogFile();
   if (constraints_violation_flag_pub_) {
     constraints_violation_flag_pub_->on_deactivate();
   }
@@ -147,17 +220,161 @@ void DynamicWindowVectorPursuitController::deactivate()
 void DynamicWindowVectorPursuitController::cleanup()
 {
   rpp::RegulatedPurePursuitController::cleanup();
+  closeCsvLogFile();
   constraints_violation_flag_pub_.reset();
+}
+
+void DynamicWindowVectorPursuitController::setPlan(const nav_msgs::msg::Path & path)
+{
+  std::lock_guard<std::mutex> lock_reinit(mutex_);
+  rpp::RegulatedPurePursuitController::setPlan(path);
+  if (!enable_csv_logging_) {
+    return;
+  }
+  openNewCsvLogFile(rclcpp::Clock(RCL_SYSTEM_TIME).now());
+}
+
+void DynamicWindowVectorPursuitController::openNewCsvLogFile(const rclcpp::Time & stamp)
+{
+  closeCsvLogFile();
+
+  const auto sec = static_cast<std::time_t>(stamp.seconds());
+  const auto nsec = static_cast<uint32_t>(stamp.nanoseconds() % 1000000000LL);
+  std::tm tm_snapshot {};
+  if (const std::tm * tm_ptr = std::localtime(&sec)) {
+    tm_snapshot = *tm_ptr;
+  }
+
+  std::ostringstream filename;
+  filename << csv_filename_prefix_ << "_"
+           << std::put_time(&tm_snapshot, "%Y%m%d_%H%M%S")
+           << "_" << std::setw(9) << std::setfill('0') << nsec
+           << ".csv";
+  const std::filesystem::path path = std::filesystem::path(csv_log_directory_) / filename.str();
+  csv_stream_.open(path.string(), std::ios::out | std::ios::trunc);
+  if (!csv_stream_.is_open()) {
+    RCLCPP_WARN(logger_, "Failed to open DWVP csv log file: %s", path.string().c_str());
+    return;
+  }
+
+  csv_header_written_ = false;
+  RCLCPP_INFO(logger_, "DWVP csv logging started: %s", path.string().c_str());
+}
+
+void DynamicWindowVectorPursuitController::closeCsvLogFile()
+{
+  if (!csv_stream_.is_open()) {
+    csv_header_written_ = false;
+    return;
+  }
+
+  csv_stream_.flush();
+  csv_stream_.close();
+  csv_header_written_ = false;
+}
+
+void DynamicWindowVectorPursuitController::writeCsvLogLine(
+  const rclcpp::Time & stamp,
+  const geometry_msgs::msg::PoseStamped & pose,
+  const geometry_msgs::msg::Twist & speed,
+  const geometry_msgs::msg::Twist & feedback_speed,
+  const geometry_msgs::msg::Twist & cmd_velocity,
+  const DynamicWindowBounds3D & dynamic_window,
+  double curvature,
+  double regulated_speed,
+  double lookahead_dist,
+  double lookahead_yaw,
+  bool is_accel,
+  bool constraints_violation)
+{
+  if (!enable_csv_logging_) {
+    return;
+  }
+  if (!csv_stream_.is_open()) {
+    openNewCsvLogFile(stamp);
+  }
+  if (!csv_stream_.is_open()) {
+    return;
+  }
+
+  if (!csv_header_written_) {
+    csv_stream_
+      << "sec,nsec,x,y,yaw,"
+      << "v_real,w_real,v_now,w_now,v_cmd,w_cmd,v_nav,w_nav,"
+      << "vx_real,vy_real,vx_now,vy_now,vx_cmd,vy_cmd,vx_nav,vy_nav,"
+      << "velocity_violation,curvature,"
+      << "dw_vx_max,dw_vx_min,dw_vy_max,dw_vy_min,dw_w_max,dw_w_min,"
+      << "v_reg,lookahead_dist,lookahead_yaw,is_accel\n";
+    csv_header_written_ = true;
+  }
+
+  const auto sec = static_cast<int32_t>(stamp.seconds());
+  const auto nsec = static_cast<uint32_t>(stamp.nanoseconds() % 1000000000LL);
+  const auto compute_nav_axis = [&](double next_vel, double current_vel, double min_vel, double max_vel,
+      double max_accel) -> double
+    {
+      const double lower = std::max(current_vel - max_accel * control_duration_, min_vel);
+      const double upper = std::min(current_vel + max_accel * control_duration_, max_vel);
+      return std::clamp(next_vel, lower, upper);
+    };
+  const double vx_nav = compute_nav_axis(
+    cmd_velocity.linear.x, feedback_speed.linear.x, min_vel_x_, max_vel_x_, max_accel_x_);
+  const double vy_nav = compute_nav_axis(
+    cmd_velocity.linear.y, feedback_speed.linear.y, min_vel_y_, max_vel_y_, max_accel_y_);
+  const double w_nav = compute_nav_axis(
+    cmd_velocity.angular.z, feedback_speed.angular.z, min_vel_theta_, max_vel_theta_, max_accel_theta_);
+
+  const double v_real = std::hypot(speed.linear.x, speed.linear.y);
+  const double v_now = std::hypot(feedback_speed.linear.x, feedback_speed.linear.y);
+  const double v_cmd = std::hypot(cmd_velocity.linear.x, cmd_velocity.linear.y);
+  const double v_nav = std::hypot(vx_nav, vy_nav);
+
+  csv_stream_ << sec << ","
+              << nsec << ","
+              << std::fixed << std::setprecision(6)
+              << pose.pose.position.x << ","
+              << pose.pose.position.y << ","
+              << tf2::getYaw(pose.pose.orientation) << ","
+              << v_real << ","
+              << speed.angular.z << ","
+              << v_now << ","
+              << feedback_speed.angular.z << ","
+              << v_cmd << ","
+              << cmd_velocity.angular.z << ","
+              << v_nav << ","
+              << w_nav << ","
+              << speed.linear.x << ","
+              << speed.linear.y << ","
+              << feedback_speed.linear.x << ","
+              << feedback_speed.linear.y << ","
+              << cmd_velocity.linear.x << ","
+              << cmd_velocity.linear.y << ","
+              << vx_nav << ","
+              << vy_nav << ","
+              << (constraints_violation ? 1 : 0) << ","
+              << curvature << ","
+              << dynamic_window.max_vx << ","
+              << dynamic_window.min_vx << ","
+              << dynamic_window.max_vy << ","
+              << dynamic_window.min_vy << ","
+              << dynamic_window.max_w << ","
+              << dynamic_window.min_w << ","
+              << regulated_speed << ","
+              << lookahead_dist << ","
+              << lookahead_yaw << ","
+              << (is_accel ? 1 : 0)
+              << "\n";
+  csv_stream_.flush();
 }
 
 double DynamicWindowVectorPursuitController::getLookAheadDistanceOmni(
   const geometry_msgs::msg::Twist & speed) const
 {
-  double lookahead_dist = params_->lookahead_dist;
-  if (params_->use_velocity_scaled_lookahead_dist) {
-    lookahead_dist = std::hypot(speed.linear.x, speed.linear.y) * params_->lookahead_time;
+  double lookahead_dist = lookahead_dist_;
+  if (use_velocity_scaled_lookahead_dist_) {
+    lookahead_dist = std::hypot(speed.linear.x, speed.linear.y) * lookahead_time_;
     lookahead_dist = std::clamp(
-      lookahead_dist, params_->min_lookahead_dist, params_->max_lookahead_dist);
+      lookahead_dist, min_lookahead_dist_, max_lookahead_dist_);
   }
   return lookahead_dist;
 }
@@ -564,7 +781,7 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
   const geometry_msgs::msg::Twist & speed,
   nav2_core::GoalChecker * goal_checker)
 {
-  std::lock_guard<std::mutex> lock_reinit(param_handler_->getMutex());
+  std::lock_guard<std::mutex> lock_reinit(mutex_);
 
   nav2_costmap_2d::Costmap2D * costmap = costmap_ros_->getCostmap();
   std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*(costmap->getMutex()));
@@ -577,12 +794,10 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
     goal_dist_tol_ = pose_tolerance.position.x;
   }
 
-  auto transformed_plan = path_handler_->transformGlobalPlan(
-    pose, params_->max_robot_pose_search_dist, params_->interpolate_curvature_after_goal);
-  global_path_pub_->publish(transformed_plan);
+  auto transformed_plan = transformGlobalPlan(pose);
 
   if (transformed_plan.poses.empty()) {
-    throw nav2_core::NoValidControl(
+    throw nav2_core::PlannerException(
             "DynamicWindowVectorPursuitController: transformed plan is empty.");
   }
 
@@ -590,12 +805,17 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
     (velocity_feedback_ == "CLOSED_LOOP") ? speed : last_command_velocity_;
 
   const double lookahead_dist = getLookAheadDistanceOmni(feedback_speed);
-  auto carrot_pose = getLookAheadPoint(
-    lookahead_dist, transformed_plan, params_->interpolate_curvature_after_goal);
+  auto carrot_pose = getLookAheadPoint(lookahead_dist, transformed_plan);
   carrot_pub_->publish(createCarrotMsg(carrot_pose));
+  const double carrot_dist2 =
+    (carrot_pose.pose.position.x * carrot_pose.pose.position.x) +
+    (carrot_pose.pose.position.y * carrot_pose.pose.position.y);
+  const double curvature = (carrot_dist2 > 1e-9) ?
+    (2.0 * carrot_pose.pose.position.y / carrot_dist2) : 0.0;
 
   const double lookahead_yaw = computeLookAheadYaw(transformed_plan, lookahead_dist);
   const geometry_msgs::msg::Twist desired_velocity = computeDesiredVelocity(carrot_pose, lookahead_yaw);
+  const double regulated_speed = std::hypot(desired_velocity.linear.x, desired_velocity.linear.y);
   const DynamicWindowBounds3D dynamic_window = computeDynamicWindow(feedback_speed);
   const bool is_accel = shouldAccelerate(transformed_plan, feedback_speed);
 
@@ -604,21 +824,16 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
     computeOptimalVelocityWithinDynamicWindow(desired_velocity, dynamic_window, is_accel) :
     clipVelocityToBounds(desired_velocity, dynamic_window);
 
-  if (params_->use_collision_detection && use_collision_detection_for_omni_) {
+  if (use_collision_detection_ && use_collision_detection_for_omni_) {
     const double translational_speed = std::hypot(cmd_twist.linear.x, cmd_twist.linear.y);
     const double carrot_dist = std::hypot(carrot_pose.pose.position.x, carrot_pose.pose.position.y);
-    if (collision_checker_->isCollisionImminent(
+    if (isCollisionImminent(
         pose, translational_speed, cmd_twist.angular.z, carrot_dist))
     {
-      throw nav2_core::NoValidControl(
+      throw nav2_core::PlannerException(
               "DynamicWindowVectorPursuitController detected collision ahead.");
     }
   }
-
-  is_rotating_to_heading_ = false;
-  std_msgs::msg::Bool is_rotating_to_heading_msg;
-  is_rotating_to_heading_msg.data = false;
-  is_rotating_to_heading_pub_->publish(is_rotating_to_heading_msg);
 
   geometry_msgs::msg::TwistStamped cmd_vel;
   cmd_vel.header = pose.header;
@@ -627,6 +842,23 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
   std_msgs::msg::Bool constraints_violation_flag_msg;
   constraints_violation_flag_msg.data =
     evaluateVelocityConstraints(cmd_vel.twist, feedback_speed);
+  rclcpp::Time log_stamp(pose.header.stamp);
+  if (log_stamp.nanoseconds() == 0) {
+    log_stamp = rclcpp::Clock(RCL_SYSTEM_TIME).now();
+  }
+  writeCsvLogLine(
+    log_stamp,
+    pose,
+    speed,
+    feedback_speed,
+    cmd_vel.twist,
+    dynamic_window,
+    curvature,
+    regulated_speed,
+    lookahead_dist,
+    lookahead_yaw,
+    is_accel,
+    constraints_violation_flag_msg.data);
   if (constraints_violation_flag_pub_) {
     constraints_violation_flag_pub_->publish(constraints_violation_flag_msg);
   }
@@ -638,5 +870,5 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
 }  // namespace nav2_dynamic_window_vector_pursuit_controller
 
 PLUGINLIB_EXPORT_CLASS(
-  dwvp::DynamicWindowVectorPursuitController,
+  nav2_dynamic_window_vector_pursuit_controller::DynamicWindowVectorPursuitController,
   nav2_core::Controller)
