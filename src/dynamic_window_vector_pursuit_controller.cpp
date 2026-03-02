@@ -33,6 +33,7 @@
 #error "Neither nav2_core/controller_exceptions.hpp nor nav2_core/exceptions.hpp was found."
 #endif
 #include "nav2_util/node_utils.hpp"
+#include "nav2_util/robot_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "tf2/utils.hpp"
@@ -139,6 +140,9 @@ void DynamicWindowVectorPursuitController::configure(
   declare_parameter_if_not_declared(
     node.get(), name + ".csv_filename_prefix",
     rclcpp::ParameterValue(std::string("dwvp_log")));
+  declare_parameter_if_not_declared(
+    node.get(), name + ".csv_pose_frame",
+    rclcpp::ParameterValue(std::string("map")));
 
   node->get_parameter(name + ".max_vel_x", max_vel_x_);
   node->get_parameter(name + ".min_vel_x", min_vel_x_);
@@ -157,6 +161,7 @@ void DynamicWindowVectorPursuitController::configure(
   node->get_parameter(name + ".enable_csv_logging", enable_csv_logging_);
   node->get_parameter(name + ".csv_log_directory", csv_log_directory_);
   node->get_parameter(name + ".csv_filename_prefix", csv_filename_prefix_);
+  node->get_parameter(name + ".csv_pose_frame", csv_pose_frame_);
 
   max_accel_x_ = std::max(1e-6, std::abs(max_accel_x_));
   max_accel_y_ = std::max(1e-6, std::abs(max_accel_y_));
@@ -276,6 +281,8 @@ void DynamicWindowVectorPursuitController::closeCsvLogFile()
 void DynamicWindowVectorPursuitController::writeCsvLogLine(
   const rclcpp::Time & stamp,
   const geometry_msgs::msg::PoseStamped & pose,
+  const geometry_msgs::msg::PoseStamped & map_pose,
+  bool map_pose_valid,
   const geometry_msgs::msg::Twist & speed,
   const geometry_msgs::msg::Twist & feedback_speed,
   const geometry_msgs::msg::Twist & cmd_velocity,
@@ -299,7 +306,7 @@ void DynamicWindowVectorPursuitController::writeCsvLogLine(
 
   if (!csv_header_written_) {
     csv_stream_
-      << "sec,nsec,x,y,yaw,"
+      << "sec,nsec,x,y,yaw,map_x,map_y,map_yaw,map_pose_valid,"
       << "v_real,w_real,v_now,w_now,v_cmd,w_cmd,v_nav,w_nav,"
       << "vx_real,vy_real,vx_now,vy_now,vx_cmd,vy_cmd,vx_nav,vy_nav,"
       << "velocity_violation,curvature,"
@@ -328,6 +335,10 @@ void DynamicWindowVectorPursuitController::writeCsvLogLine(
   const double v_now = std::hypot(feedback_speed.linear.x, feedback_speed.linear.y);
   const double v_cmd = std::hypot(cmd_velocity.linear.x, cmd_velocity.linear.y);
   const double v_nav = std::hypot(vx_nav, vy_nav);
+  const double map_x = map_pose_valid ? map_pose.pose.position.x : std::numeric_limits<double>::quiet_NaN();
+  const double map_y = map_pose_valid ? map_pose.pose.position.y : std::numeric_limits<double>::quiet_NaN();
+  const double map_yaw = map_pose_valid ? tf2::getYaw(map_pose.pose.orientation) :
+    std::numeric_limits<double>::quiet_NaN();
 
   csv_stream_ << sec << ","
               << nsec << ","
@@ -335,6 +346,10 @@ void DynamicWindowVectorPursuitController::writeCsvLogLine(
               << pose.pose.position.x << ","
               << pose.pose.position.y << ","
               << tf2::getYaw(pose.pose.orientation) << ","
+              << map_x << ","
+              << map_y << ","
+              << map_yaw << ","
+              << (map_pose_valid ? 1 : 0) << ","
               << v_real << ","
               << speed.angular.z << ","
               << v_now << ","
@@ -846,9 +861,15 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
   if (log_stamp.nanoseconds() == 0) {
     log_stamp = rclcpp::Clock(RCL_SYSTEM_TIME).now();
   }
+  geometry_msgs::msg::PoseStamped pose_in_map;
+  const bool map_pose_valid = !csv_pose_frame_.empty() &&
+    nav2_util::transformPoseInTargetFrame(
+    pose, pose_in_map, *tf_, csv_pose_frame_, costmap_ros_->getTransformTolerance());
   writeCsvLogLine(
     log_stamp,
     pose,
+    pose_in_map,
+    map_pose_valid,
     speed,
     feedback_speed,
     cmd_vel.twist,
