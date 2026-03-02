@@ -35,7 +35,6 @@
 #include "nav2_util/node_utils.hpp"
 #include "nav2_util/robot_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
-#include "std_msgs/msg/bool.hpp"
 #include "tf2/utils.hpp"
 
 namespace dwvp = nav2_dynamic_window_vector_pursuit_controller;
@@ -201,32 +200,23 @@ void DynamicWindowVectorPursuitController::configure(
     }
   }
 
-  constraints_violation_flag_pub_ =
-    node->create_publisher<std_msgs::msg::Bool>("constraints_violation_flag", 1);
 }
 
 void DynamicWindowVectorPursuitController::activate()
 {
   rpp::RegulatedPurePursuitController::activate();
-  if (constraints_violation_flag_pub_) {
-    constraints_violation_flag_pub_->on_activate();
-  }
 }
 
 void DynamicWindowVectorPursuitController::deactivate()
 {
   rpp::RegulatedPurePursuitController::deactivate();
   closeCsvLogFile();
-  if (constraints_violation_flag_pub_) {
-    constraints_violation_flag_pub_->on_deactivate();
-  }
 }
 
 void DynamicWindowVectorPursuitController::cleanup()
 {
   rpp::RegulatedPurePursuitController::cleanup();
   closeCsvLogFile();
-  constraints_violation_flag_pub_.reset();
 }
 
 void DynamicWindowVectorPursuitController::setPlan(const nav_msgs::msg::Path & path)
@@ -837,7 +827,7 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
   const geometry_msgs::msg::Twist cmd_twist =
     use_dynamic_window_vector_pursuit_ ?
     computeOptimalVelocityWithinDynamicWindow(desired_velocity, dynamic_window, is_accel) :
-    clipVelocityToBounds(desired_velocity, dynamic_window);
+    desired_velocity;
 
   if (use_collision_detection_ && use_collision_detection_for_omni_) {
     const double translational_speed = std::hypot(cmd_twist.linear.x, cmd_twist.linear.y);
@@ -854,8 +844,7 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
   cmd_vel.header = pose.header;
   cmd_vel.twist = cmd_twist;
 
-  std_msgs::msg::Bool constraints_violation_flag_msg;
-  constraints_violation_flag_msg.data =
+  const bool constraints_violation =
     evaluateVelocityConstraints(cmd_vel.twist, feedback_speed);
   rclcpp::Time log_stamp(pose.header.stamp);
   if (log_stamp.nanoseconds() == 0) {
@@ -879,10 +868,7 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
     lookahead_dist,
     lookahead_yaw,
     is_accel,
-    constraints_violation_flag_msg.data);
-  if (constraints_violation_flag_pub_) {
-    constraints_violation_flag_pub_->publish(constraints_violation_flag_msg);
-  }
+    constraints_violation);
 
   last_command_velocity_ = cmd_vel.twist;
   return cmd_vel;

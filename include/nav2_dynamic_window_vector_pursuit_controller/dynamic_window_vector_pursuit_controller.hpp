@@ -17,8 +17,6 @@
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "nav2_regulated_pure_pursuit_controller/regulated_pure_pursuit_controller.hpp"
-#include "rclcpp_lifecycle/lifecycle_publisher.hpp"
-#include "std_msgs/msg/bool.hpp"
 
 namespace nav2_dynamic_window_vector_pursuit_controller
 {
@@ -132,8 +130,6 @@ protected:
   bool csv_header_written_ {false};
   std::ofstream csv_stream_;
   geometry_msgs::msg::Twist last_command_velocity_;
-  std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Bool>>
-  constraints_violation_flag_pub_;
 };
 
 }  // namespace nav2_dynamic_window_vector_pursuit_controller
