@@ -488,8 +488,7 @@ geometry_msgs::msg::Twist DynamicWindowVectorPursuitController::computeDesiredVe
 
   if (max_translational_speed > 1e-6) {
     const double time_to_goal_position = distance / max_translational_speed;
-    const double time_to_goal_orientation =
-      std::max(min_orientation_time_, orientation_time_weight_ * time_to_goal_position);
+    const double time_to_goal_orientation = orientation_time_weight_ * time_to_goal_position;
     const double heading_error = angles::normalize_angle(lookahead_yaw);
     desired_velocity.angular.z = heading_error / time_to_goal_orientation;
   }
