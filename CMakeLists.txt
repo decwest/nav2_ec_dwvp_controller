@@ -1,8 +1,7 @@
 cmake_minimum_required(VERSION 3.8)
-project(nav2_dynamic_window_vector_pursuit_controller)
+project(nav2_omnidirectional_dwvp_controller)
 
 find_package(ament_cmake REQUIRED)
-find_package(ament_index_cpp REQUIRED)
 find_package(nav2_common REQUIRED)
 find_package(nav2_core REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
@@ -23,7 +22,6 @@ set(CMAKE_CXX_STANDARD 17)
 include_directories(include)
 
 set(dependencies
-  ament_index_cpp
   angles
   geometry_msgs
   nav2_core
@@ -38,10 +36,10 @@ set(dependencies
   tf2_geometry_msgs
 )
 
-set(library_name nav2_dynamic_window_vector_pursuit_controller)
+set(library_name nav2_omnidirectional_dwvp_controller)
 
 add_library(${library_name} SHARED
-  src/dynamic_window_vector_pursuit_controller.cpp
+  src/omnidirectional_dwvp_controller.cpp
 )
 
 ament_target_dependencies(${library_name}
@@ -60,10 +58,26 @@ install(DIRECTORY include/
 
 pluginlib_export_plugin_description_file(
   nav2_core
-  nav2_dynamic_window_vector_pursuit_controller.xml
+  nav2_omnidirectional_dwvp_controller.xml
 )
 
+install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
+install(FILES README.md LICENSE DESTINATION share/${PROJECT_NAME})
+
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_executable(solver_fixture_runner test/solver_fixture_runner.cpp)
+  target_link_libraries(solver_fixture_runner ${library_name})
+  ament_target_dependencies(solver_fixture_runner ${dependencies})
+  ament_add_test(solver_parity
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/check_solver_fixtures.py
+      $<TARGET_FILE:solver_fixture_runner> ${CMAKE_CURRENT_SOURCE_DIR}/test/solver_cases.json
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+  )
+  ament_add_gtest(test_controller test/test_controller.cpp)
+  target_link_libraries(test_controller ${library_name})
+  ament_target_dependencies(test_controller ${dependencies})
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)

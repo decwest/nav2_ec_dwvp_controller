@@ -6,7 +6,7 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-#include "nav2_dynamic_window_vector_pursuit_controller/dynamic_window_vector_pursuit_controller.hpp"
+#include "nav2_omnidirectional_dwvp_controller/omnidirectional_dwvp_controller.hpp"
 
 #include <algorithm>
 #include <array>
@@ -24,7 +24,6 @@
 #include <vector>
 
 #include "angles/angles.h"
-#include "ament_index_cpp/get_package_share_directory.hpp"
 #if __has_include("nav2_core/controller_exceptions.hpp")
 #include "nav2_core/controller_exceptions.hpp"
 #elif __has_include("nav2_core/exceptions.hpp")
@@ -37,42 +36,13 @@
 #include "pluginlib/class_list_macros.hpp"
 #include "tf2/utils.hpp"
 
-namespace dwvp = nav2_dynamic_window_vector_pursuit_controller;
 namespace rpp = nav2_regulated_pure_pursuit_controller;
 
 using nav2_util::declare_parameter_if_not_declared;
 
-namespace nav2_dynamic_window_vector_pursuit_controller
+namespace nav2_omnidirectional_dwvp_controller
 {
-namespace
-{
-std::string getDefaultCsvLogDirectory(const rclcpp::Logger & logger)
-{
-  try {
-    const auto pkg_share =
-      ament_index_cpp::get_package_share_directory("nav2_dynamic_window_vector_pursuit_controller");
-    const auto log_dir = std::filesystem::path(pkg_share) / "data";
-    std::error_code ec;
-    std::filesystem::create_directories(log_dir, ec);
-    if (ec) {
-      RCLCPP_WARN(
-        logger,
-        "Failed to create default csv directory '%s' (%s). Falling back to /tmp.",
-        log_dir.string().c_str(), ec.message().c_str());
-      return "/tmp";
-    }
-    return log_dir.string();
-  } catch (const std::exception & e) {
-    RCLCPP_WARN(
-      logger,
-      "Failed to resolve package share for default csv directory (%s). Falling back to /tmp.",
-      e.what());
-    return "/tmp";
-  }
-}
-}  // namespace
-
-void DynamicWindowVectorPursuitController::configure(
+void OmnidirectionalDWVPController::configure(
   const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
   std::string name,
   std::shared_ptr<tf2_ros::Buffer> tf,
@@ -83,10 +53,10 @@ void DynamicWindowVectorPursuitController::configure(
   auto node = parent.lock();
   if (!node) {
     throw std::runtime_error(
-            "Failed to lock parent node in DynamicWindowVectorPursuitController::configure");
+            "Failed to lock parent node in OmnidirectionalDWVPController::configure");
   }
 
-  const std::string default_csv_log_directory = getDefaultCsvLogDirectory(logger_);
+  const std::string default_csv_log_directory = "/tmp";
 
   declare_parameter_if_not_declared(
     node.get(), name + ".max_vel_x",
@@ -129,7 +99,7 @@ void DynamicWindowVectorPursuitController::configure(
     rclcpp::ParameterValue(true));
   declare_parameter_if_not_declared(
     node.get(), name + ".use_collision_detection_for_omni",
-    rclcpp::ParameterValue(false));
+    rclcpp::ParameterValue(true));
   declare_parameter_if_not_declared(
     node.get(), name + ".enable_csv_logging",
     rclcpp::ParameterValue(false));
@@ -155,31 +125,46 @@ void DynamicWindowVectorPursuitController::configure(
   node->get_parameter(name + ".orientation_time_weight", orientation_time_weight_);
   node->get_parameter(name + ".min_orientation_time", min_orientation_time_);
   node->get_parameter(name + ".velocity_feedback", velocity_feedback_);
-  node->get_parameter(name + ".use_dynamic_window_vector_pursuit", use_dynamic_window_vector_pursuit_);
-  node->get_parameter(name + ".use_collision_detection_for_omni", use_collision_detection_for_omni_);
+  node->get_parameter(
+    name + ".use_dynamic_window_vector_pursuit",
+    use_dynamic_window_vector_pursuit_);
+  node->get_parameter(
+    name + ".use_collision_detection_for_omni",
+    use_collision_detection_for_omni_);
   node->get_parameter(name + ".enable_csv_logging", enable_csv_logging_);
   node->get_parameter(name + ".csv_log_directory", csv_log_directory_);
   node->get_parameter(name + ".csv_filename_prefix", csv_filename_prefix_);
   node->get_parameter(name + ".csv_pose_frame", csv_pose_frame_);
 
-  max_accel_x_ = std::max(1e-6, std::abs(max_accel_x_));
-  max_accel_y_ = std::max(1e-6, std::abs(max_accel_y_));
-  max_accel_theta_ = std::max(1e-6, std::abs(max_accel_theta_));
-  min_orientation_time_ = std::max(1e-3, min_orientation_time_);
-  orientation_time_weight_ = std::max(1e-3, orientation_time_weight_);
-
+  const auto valid_axis = [](double lo, double hi, double accel) {
+      return std::isfinite(lo) && std::isfinite(hi) && lo <= 0.0 && hi >= 0.0 &&
+             lo <= hi && std::isfinite(accel) && accel > 0.0;
+    };
+  if (!valid_axis(min_vel_x_, max_vel_x_, max_accel_x_) ||
+    !valid_axis(min_vel_y_, max_vel_y_, max_accel_y_) ||
+    !valid_axis(min_vel_theta_, max_vel_theta_, max_accel_theta_) ||
+    !std::isfinite(orientation_time_weight_) || orientation_time_weight_ <= 0.0 ||
+    !std::isfinite(min_orientation_time_) || min_orientation_time_ <= 0.0 ||
+    !std::isfinite(control_duration_) || control_duration_ <= 0.0 ||
+    !std::isfinite(max_allowed_time_to_collision_up_to_carrot_) ||
+    max_allowed_time_to_collision_up_to_carrot_ < 0.0 ||
+    !std::isfinite(desired_linear_vel_) || desired_linear_vel_ < 0.0 ||
+    !std::isfinite(approach_velocity_scaling_dist_) || approach_velocity_scaling_dist_ < 0.0)
+  {
+    throw std::invalid_argument("Invalid DWVP limits, control period, or orientation time");
+  }
   std::transform(
     velocity_feedback_.begin(), velocity_feedback_.end(), velocity_feedback_.begin(),
     [](const unsigned char c) {return static_cast<char>(std::toupper(c));});
-
-  if (use_collision_detection_ && !use_collision_detection_for_omni_) {
+  if (velocity_feedback_ != "OPEN_LOOP" && velocity_feedback_ != "CLOSED_LOOP") {
+    throw std::invalid_argument("velocity_feedback must be OPEN_LOOP or CLOSED_LOOP");
+  }
+  if (use_regulated_linear_velocity_scaling_) {
     RCLCPP_WARN(
       logger_,
-      "Collision detection is enabled in RPP params, but DWVP omni collision checking is "
-      "disabled by default. Set %s.use_collision_detection_for_omni:=true to enable approximate "
-      "checking based on translational speed magnitude.",
-      name.c_str());
+      "DWVP supports cost and approach regulation; curvature regulation is unused.");
   }
+  last_command_valid_ = false;
 
   if (enable_csv_logging_) {
     if (csv_log_directory_.empty()) {
@@ -202,34 +187,50 @@ void DynamicWindowVectorPursuitController::configure(
 
 }
 
-void DynamicWindowVectorPursuitController::activate()
+void OmnidirectionalDWVPController::setSpeedLimit(
+  const double & speed_limit,
+  const bool & percentage)
 {
+  if (!std::isfinite(speed_limit) || speed_limit < 0.0) {
+    throw std::invalid_argument("Speed limit must be finite and nonnegative");
+  }
+  std::lock_guard<std::mutex> lock_reinit(mutex_);
+  rpp::RegulatedPurePursuitController::setSpeedLimit(speed_limit, percentage);
+}
+
+void OmnidirectionalDWVPController::activate()
+{
+  last_command_valid_ = false;
   rpp::RegulatedPurePursuitController::activate();
 }
 
-void DynamicWindowVectorPursuitController::deactivate()
+void OmnidirectionalDWVPController::deactivate()
 {
+  last_command_valid_ = false;
   rpp::RegulatedPurePursuitController::deactivate();
   closeCsvLogFile();
 }
 
-void DynamicWindowVectorPursuitController::cleanup()
+void OmnidirectionalDWVPController::cleanup()
 {
+  last_command_valid_ = false;
   rpp::RegulatedPurePursuitController::cleanup();
   closeCsvLogFile();
 }
 
-void DynamicWindowVectorPursuitController::setPlan(const nav_msgs::msg::Path & path)
+void OmnidirectionalDWVPController::setPlan(const nav_msgs::msg::Path & path)
 {
   std::lock_guard<std::mutex> lock_reinit(mutex_);
   rpp::RegulatedPurePursuitController::setPlan(path);
+  // New plans may follow a stopped/cancelled goal. Seed from measured speed once.
+  last_command_valid_ = false;
   if (!enable_csv_logging_) {
     return;
   }
   openNewCsvLogFile(rclcpp::Clock(RCL_SYSTEM_TIME).now());
 }
 
-void DynamicWindowVectorPursuitController::openNewCsvLogFile(const rclcpp::Time & stamp)
+void OmnidirectionalDWVPController::openNewCsvLogFile(const rclcpp::Time & stamp)
 {
   closeCsvLogFile();
 
@@ -256,7 +257,7 @@ void DynamicWindowVectorPursuitController::openNewCsvLogFile(const rclcpp::Time 
   RCLCPP_INFO(logger_, "DWVP csv logging started: %s", path.string().c_str());
 }
 
-void DynamicWindowVectorPursuitController::closeCsvLogFile()
+void OmnidirectionalDWVPController::closeCsvLogFile()
 {
   if (!csv_stream_.is_open()) {
     csv_header_written_ = false;
@@ -268,7 +269,7 @@ void DynamicWindowVectorPursuitController::closeCsvLogFile()
   csv_header_written_ = false;
 }
 
-void DynamicWindowVectorPursuitController::writeCsvLogLine(
+void OmnidirectionalDWVPController::writeCsvLogLine(
   const rclcpp::Time & stamp,
   const geometry_msgs::msg::PoseStamped & pose,
   const geometry_msgs::msg::PoseStamped & map_pose,
@@ -307,7 +308,8 @@ void DynamicWindowVectorPursuitController::writeCsvLogLine(
 
   const auto sec = static_cast<int32_t>(stamp.seconds());
   const auto nsec = static_cast<uint32_t>(stamp.nanoseconds() % 1000000000LL);
-  const auto compute_nav_axis = [&](double next_vel, double current_vel, double min_vel, double max_vel,
+  const auto compute_nav_axis =
+    [&](double next_vel, double current_vel, double min_vel, double max_vel,
       double max_accel) -> double
     {
       const double lower = std::max(current_vel - max_accel * control_duration_, min_vel);
@@ -319,14 +321,17 @@ void DynamicWindowVectorPursuitController::writeCsvLogLine(
   const double vy_nav = compute_nav_axis(
     cmd_velocity.linear.y, feedback_speed.linear.y, min_vel_y_, max_vel_y_, max_accel_y_);
   const double w_nav = compute_nav_axis(
-    cmd_velocity.angular.z, feedback_speed.angular.z, min_vel_theta_, max_vel_theta_, max_accel_theta_);
+    cmd_velocity.angular.z, feedback_speed.angular.z, min_vel_theta_, max_vel_theta_,
+    max_accel_theta_);
 
   const double v_real = std::hypot(speed.linear.x, speed.linear.y);
   const double v_now = std::hypot(feedback_speed.linear.x, feedback_speed.linear.y);
   const double v_cmd = std::hypot(cmd_velocity.linear.x, cmd_velocity.linear.y);
   const double v_nav = std::hypot(vx_nav, vy_nav);
-  const double map_x = map_pose_valid ? map_pose.pose.position.x : std::numeric_limits<double>::quiet_NaN();
-  const double map_y = map_pose_valid ? map_pose.pose.position.y : std::numeric_limits<double>::quiet_NaN();
+  const double map_x =
+    map_pose_valid ? map_pose.pose.position.x : std::numeric_limits<double>::quiet_NaN();
+  const double map_y =
+    map_pose_valid ? map_pose.pose.position.y : std::numeric_limits<double>::quiet_NaN();
   const double map_yaw = map_pose_valid ? tf2::getYaw(map_pose.pose.orientation) :
     std::numeric_limits<double>::quiet_NaN();
 
@@ -372,7 +377,7 @@ void DynamicWindowVectorPursuitController::writeCsvLogLine(
   csv_stream_.flush();
 }
 
-double DynamicWindowVectorPursuitController::getLookAheadDistanceOmni(
+double OmnidirectionalDWVPController::getLookAheadDistanceOmni(
   const geometry_msgs::msg::Twist & speed) const
 {
   double lookahead_dist = lookahead_dist_;
@@ -384,7 +389,7 @@ double DynamicWindowVectorPursuitController::getLookAheadDistanceOmni(
   return lookahead_dist;
 }
 
-double DynamicWindowVectorPursuitController::computeLookAheadYaw(
+double OmnidirectionalDWVPController::computeLookAheadYaw(
   const nav_msgs::msg::Path & transformed_plan,
   double lookahead_dist) const
 {
@@ -429,7 +434,7 @@ double DynamicWindowVectorPursuitController::computeLookAheadYaw(
     goal_pose_it->pose.position.x - prev_it->pose.position.x);
 }
 
-double DynamicWindowVectorPursuitController::computeRemainingPathDistance(
+double OmnidirectionalDWVPController::computeRemainingPathDistance(
   const nav_msgs::msg::Path & transformed_plan) const
 {
   if (transformed_plan.poses.empty()) {
@@ -449,12 +454,13 @@ double DynamicWindowVectorPursuitController::computeRemainingPathDistance(
   return distance;
 }
 
-bool DynamicWindowVectorPursuitController::shouldAccelerate(
+bool OmnidirectionalDWVPController::shouldAccelerate(
   const nav_msgs::msg::Path & transformed_plan,
   const geometry_msgs::msg::Twist & current_velocity) const
 {
   const double goal_distance = computeRemainingPathDistance(transformed_plan);
-  const double translational_speed = std::hypot(current_velocity.linear.x, current_velocity.linear.y);
+  const double translational_speed =
+    std::hypot(current_velocity.linear.x, current_velocity.linear.y);
   const double translational_accel_limit = std::min(max_accel_x_, max_accel_y_);
 
   if (translational_accel_limit <= 1e-6) {
@@ -467,7 +473,7 @@ bool DynamicWindowVectorPursuitController::shouldAccelerate(
   return goal_distance > decel_distance;
 }
 
-geometry_msgs::msg::Twist DynamicWindowVectorPursuitController::computeDesiredVelocity(
+geometry_msgs::msg::Twist OmnidirectionalDWVPController::computeDesiredVelocity(
   const geometry_msgs::msg::PoseStamped & lookahead_pose,
   const double lookahead_yaw) const
 {
@@ -486,18 +492,17 @@ geometry_msgs::msg::Twist DynamicWindowVectorPursuitController::computeDesiredVe
     desired_velocity.linear.y = max_translational_speed * dy / distance;
   }
 
-  if (max_translational_speed > 1e-6) {
-    const double time_to_goal_position = distance / max_translational_speed;
-    const double time_to_goal_orientation = orientation_time_weight_ * time_to_goal_position;
-    const double heading_error = angles::normalize_angle(lookahead_yaw);
-    desired_velocity.angular.z = heading_error / time_to_goal_orientation;
-  }
+  const double position_time = max_translational_speed > 1e-6 ?
+    distance / max_translational_speed : 0.0;
+  const double orientation_time = std::max(
+    min_orientation_time_, orientation_time_weight_ * position_time);
+  desired_velocity.angular.z = angles::normalize_angle(lookahead_yaw) / orientation_time;
 
   return desired_velocity;
 }
 
-DynamicWindowVectorPursuitController::DynamicWindowBounds3D
-DynamicWindowVectorPursuitController::computeDynamicWindow(
+OmnidirectionalDWVPController::DynamicWindowBounds3D
+OmnidirectionalDWVPController::computeDynamicWindow(
   const geometry_msgs::msg::Twist & current_velocity) const
 {
   DynamicWindowBounds3D bounds;
@@ -510,28 +515,143 @@ DynamicWindowVectorPursuitController::computeDynamicWindow(
   bounds.min_w = std::max(current_velocity.angular.z - max_accel_theta_ * dt, min_vel_theta_);
   bounds.max_w = std::min(current_velocity.angular.z + max_accel_theta_ * dt, max_vel_theta_);
 
-  if (bounds.min_vx > bounds.max_vx) {
-    const double clipped = std::clamp(current_velocity.linear.x, min_vel_x_, max_vel_x_);
-    bounds.min_vx = clipped;
-    bounds.max_vx = clipped;
-  }
-
-  if (bounds.min_vy > bounds.max_vy) {
-    const double clipped = std::clamp(current_velocity.linear.y, min_vel_y_, max_vel_y_);
-    bounds.min_vy = clipped;
-    bounds.max_vy = clipped;
-  }
-
-  if (bounds.min_w > bounds.max_w) {
-    const double clipped = std::clamp(current_velocity.angular.z, min_vel_theta_, max_vel_theta_);
-    bounds.min_w = clipped;
-    bounds.max_w = clipped;
+  if (bounds.min_vx > bounds.max_vx || bounds.min_vy > bounds.max_vy ||
+    bounds.min_w > bounds.max_w)
+  {
+    throw nav2_core::PlannerException(
+            "Velocity feedback has no acceleration-feasible velocity window");
   }
 
   return bounds;
 }
 
-geometry_msgs::msg::Twist DynamicWindowVectorPursuitController::clipVelocityToBounds(
+double OmnidirectionalDWVPController::maximumTranslationalSpeed() const
+{
+  return std::hypot(
+    std::max(std::abs(min_vel_x_), std::abs(max_vel_x_)),
+    std::max(std::abs(min_vel_y_), std::abs(max_vel_y_)));
+}
+
+double OmnidirectionalDWVPController::computeRegulatedSpeed(
+  const nav_msgs::msg::Path & path, const geometry_msgs::msg::Twist & speed,
+  double pose_cost)
+{
+  const double nominal = std::min(maximumTranslationalSpeed(), desired_linear_vel_);
+  if (!std::isfinite(nominal) || nominal < 0.0) {
+    throw nav2_core::PlannerException("Invalid nominal speed");
+  }
+  double regulated = nominal;
+  double sign = 1.0;
+  // Zero curvature excludes the nonholonomic PP curvature heuristic.
+  applyConstraints(0.0, speed, pose_cost, path, regulated, sign);
+  return std::clamp(regulated, 0.0, nominal);
+}
+
+OmnidirectionalDWVPController::DynamicWindowBounds3D
+OmnidirectionalDWVPController::applyRegulationToDynamicWindow(
+  const DynamicWindowBounds3D & physical_window, double regulated_speed) const
+{
+  auto result = physical_window;
+  const double maximum = maximumTranslationalSpeed();
+  const double ratio = maximum > 1e-12 ? std::clamp(regulated_speed / maximum, 0.0, 1.0) : 0.0;
+  const auto intersect = [ratio](double & lo, double & hi, double physical_lo, double physical_hi) {
+      const double cap_lo = ratio * physical_lo;
+      const double cap_hi = ratio * physical_hi;
+      if (lo > cap_hi) {
+        hi = lo;  // strongest reachable deceleration, never jump to the cap
+      } else if (hi < cap_lo) {
+        lo = hi;
+      } else {
+        lo = std::max(lo, cap_lo);
+        hi = std::min(hi, cap_hi);
+      }
+    };
+  intersect(result.min_vx, result.max_vx, min_vel_x_, max_vel_x_);
+  intersect(result.min_vy, result.max_vy, min_vel_y_, max_vel_y_);
+  return result;
+}
+
+geometry_msgs::msg::Twist OmnidirectionalDWVPController::computeGoalVelocity(
+  double yaw_error, double yaw_tolerance, const DynamicWindowBounds3D & window) const
+{
+  geometry_msgs::msg::Twist target;
+  if (std::abs(yaw_error) > yaw_tolerance) {
+    target.angular.z = std::copysign(
+      std::min(
+        std::abs(yaw_error) / min_orientation_time_,
+        std::sqrt(2.0 * max_accel_theta_ * std::abs(yaw_error))), yaw_error);
+  }
+  return clipVelocityToBounds(target, window);
+}
+
+std::vector<geometry_msgs::msg::Pose2D> OmnidirectionalDWVPController::projectMotion(
+  const geometry_msgs::msg::Pose2D & start, const geometry_msgs::msg::Twist & command,
+  double horizon, double carrot_distance, double resolution, double footprint_radius)
+{
+  std::vector<geometry_msgs::msg::Pose2D> poses {start};
+  const double speed = std::hypot(command.linear.x, command.linear.y);
+  const double swept_speed = speed + footprint_radius * std::abs(command.angular.z);
+  if (horizon <= 0.0 || swept_speed < 1e-12) {
+    return poses;
+  }
+  if (speed > 1e-12 && carrot_distance > 0.0) {
+    horizon = std::min(horizon, carrot_distance / speed);
+  }
+  const double step = std::max(1e-6, 0.5 * resolution / swept_speed);
+  const size_t steps = static_cast<size_t>(std::ceil(horizon / step));
+  for (size_t i = 1; i <= steps; ++i) {
+    const double t = horizon * static_cast<double>(i) / static_cast<double>(steps);
+    const double turn = command.angular.z * t;
+    double dx = command.linear.x * t;
+    double dy = command.linear.y * t;
+    if (std::abs(command.angular.z) > 1e-9) {
+      dx = (command.linear.x * std::sin(turn) + command.linear.y * (std::cos(turn) - 1.0)) /
+        command.angular.z;
+      dy = (command.linear.x * (1.0 - std::cos(turn)) + command.linear.y * std::sin(turn)) /
+        command.angular.z;
+    }
+    geometry_msgs::msg::Pose2D p;
+    p.x = start.x + std::cos(start.theta) * dx - std::sin(start.theta) * dy;
+    p.y = start.y + std::sin(start.theta) * dx + std::cos(start.theta) * dy;
+    p.theta = angles::normalize_angle(start.theta + turn);
+    poses.push_back(p);
+  }
+  return poses;
+}
+
+bool OmnidirectionalDWVPController::isCollisionImminentOmni(
+  const geometry_msgs::msg::PoseStamped & pose,
+  const geometry_msgs::msg::Twist & command, double carrot_distance)
+{
+  geometry_msgs::msg::Pose2D start;
+  start.x = pose.pose.position.x;
+  start.y = pose.pose.position.y;
+  start.theta = tf2::getYaw(pose.pose.orientation);
+  nav_msgs::msg::Path projected_path;
+  projected_path.header = pose.header;
+  const auto samples = projectMotion(
+    start, command, max_allowed_time_to_collision_up_to_carrot_, carrot_distance,
+    costmap_->getResolution(), costmap_ros_->getLayeredCostmap()->getCircumscribedRadius());
+  bool collision = false;
+  for (const auto & p : samples) {
+    geometry_msgs::msg::PoseStamped sample;
+    sample.header = pose.header;
+    sample.pose.position.x = p.x;
+    sample.pose.position.y = p.y;
+    sample.pose.orientation.z = std::sin(p.theta / 2.0);
+    sample.pose.orientation.w = std::cos(p.theta / 2.0);
+    projected_path.poses.push_back(sample);
+    unsigned int mx, my;
+    if (!costmap_->worldToMap(p.x, p.y, mx, my) || inCollision(p.x, p.y, p.theta)) {
+      collision = true;
+      break;
+    }
+  }
+  carrot_arc_pub_->publish(projected_path);
+  return collision;
+}
+
+geometry_msgs::msg::Twist OmnidirectionalDWVPController::clipVelocityToBounds(
   const geometry_msgs::msg::Twist & velocity,
   const DynamicWindowBounds3D & bounds) const
 {
@@ -542,7 +662,7 @@ geometry_msgs::msg::Twist DynamicWindowVectorPursuitController::clipVelocityToBo
   return clipped_velocity;
 }
 
-std::tuple<bool, double, double> DynamicWindowVectorPursuitController::computeRayBoxIntersectionAlphaRange(
+std::tuple<bool, double, double> OmnidirectionalDWVPController::computeRayBoxIntersectionAlphaRange(
   const std::array<double, 3> & ray_direction,
   const std::array<double, 3> & box_min,
   const std::array<double, 3> & box_max) const
@@ -588,7 +708,7 @@ std::tuple<bool, double, double> DynamicWindowVectorPursuitController::computeRa
   return std::make_tuple(false, 0.0, 0.0);
 }
 
-double DynamicWindowVectorPursuitController::computeClosestAlphaToBoxFromRay(
+double OmnidirectionalDWVPController::computeClosestAlphaToBoxFromRay(
   const std::array<double, 3> & ray_direction,
   const std::array<double, 3> & box_min,
   const std::array<double, 3> & box_max,
@@ -710,7 +830,7 @@ double DynamicWindowVectorPursuitController::computeClosestAlphaToBoxFromRay(
   return best_alpha;
 }
 
-geometry_msgs::msg::Twist DynamicWindowVectorPursuitController::computeOptimalVelocityWithinDynamicWindow(
+geometry_msgs::msg::Twist OmnidirectionalDWVPController::computeOptimalVelocityWithinDynamicWindow(
   const geometry_msgs::msg::Twist & desired_velocity,
   const DynamicWindowBounds3D & bounds,
   bool prefer_large_alpha) const
@@ -739,8 +859,8 @@ geometry_msgs::msg::Twist DynamicWindowVectorPursuitController::computeOptimalVe
     computeRayBoxIntersectionAlphaRange(ray_direction, box_min, box_max);
 
   const double alpha =
-    intersects ? (prefer_large_alpha ? alpha_max : alpha_min)
-    : computeClosestAlphaToBoxFromRay(ray_direction, box_min, box_max, prefer_large_alpha);
+    intersects ? (prefer_large_alpha ? alpha_max : alpha_min) :
+    computeClosestAlphaToBoxFromRay(ray_direction, box_min, box_max, prefer_large_alpha);
 
   geometry_msgs::msg::Twist optimal_velocity;
   optimal_velocity.linear.x = alpha * ray_direction[0];
@@ -750,7 +870,7 @@ geometry_msgs::msg::Twist DynamicWindowVectorPursuitController::computeOptimalVe
   return clipVelocityToBounds(optimal_velocity, bounds);
 }
 
-bool DynamicWindowVectorPursuitController::evaluateVelocityConstraints(
+bool OmnidirectionalDWVPController::evaluateVelocityConstraints(
   const geometry_msgs::msg::Twist & next_cmd_vel,
   const geometry_msgs::msg::Twist & current_cmd_vel) const
 {
@@ -780,17 +900,29 @@ bool DynamicWindowVectorPursuitController::evaluateVelocityConstraints(
   return x_violation || y_violation || w_violation;
 }
 
-geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVelocityCommands(
+geometry_msgs::msg::TwistStamped OmnidirectionalDWVPController::computeVelocityCommands(
   const geometry_msgs::msg::PoseStamped & pose,
   const geometry_msgs::msg::Twist & speed,
   nav2_core::GoalChecker * goal_checker)
 {
   std::lock_guard<std::mutex> lock_reinit(mutex_);
 
+  const geometry_msgs::msg::Twist feedback_speed =
+    (velocity_feedback_ == "CLOSED_LOOP" || !last_command_valid_) ? speed : last_command_velocity_;
+  // A failed command may cause Nav2 to stop; never reuse the pre-failure command.
+  last_command_valid_ = false;
+  if (!std::isfinite(feedback_speed.linear.x) || !std::isfinite(feedback_speed.linear.y) ||
+    !std::isfinite(feedback_speed.angular.z))
+  {
+    throw nav2_core::PlannerException("Non-finite velocity feedback");
+  }
+
+
   nav2_costmap_2d::Costmap2D * costmap = costmap_ros_->getCostmap();
   std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*(costmap->getMutex()));
 
   geometry_msgs::msg::Pose pose_tolerance;
+  pose_tolerance.orientation.w = 1.0;
   geometry_msgs::msg::Twist vel_tolerance;
   if (!goal_checker || !goal_checker->getTolerances(pose_tolerance, vel_tolerance)) {
     RCLCPP_WARN(logger_, "Unable to retrieve goal checker tolerances.");
@@ -799,14 +931,19 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
   }
 
   auto transformed_plan = transformGlobalPlan(pose);
+  geometry_msgs::msg::PoseStamped final_goal;
+  auto global_goal = global_plan_.poses.back();
+  global_goal.header.frame_id = global_plan_.header.frame_id;
+  global_goal.header.stamp = pose.header.stamp;
+  if (!transformPose(costmap_ros_->getBaseFrameID(), global_goal, final_goal)) {
+    throw nav2_core::PlannerException("Cannot transform final goal");
+  }
 
   if (transformed_plan.poses.empty()) {
     throw nav2_core::PlannerException(
-            "DynamicWindowVectorPursuitController: transformed plan is empty.");
+            "OmnidirectionalDWVPController: transformed plan is empty.");
   }
 
-  const geometry_msgs::msg::Twist feedback_speed =
-    (velocity_feedback_ == "CLOSED_LOOP") ? speed : last_command_velocity_;
 
   const double lookahead_dist = getLookAheadDistanceOmni(feedback_speed);
   auto carrot_pose = getLookAheadPoint(lookahead_dist, transformed_plan);
@@ -818,24 +955,36 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
     (2.0 * carrot_pose.pose.position.y / carrot_dist2) : 0.0;
 
   const double lookahead_yaw = computeLookAheadYaw(transformed_plan, lookahead_dist);
-  const geometry_msgs::msg::Twist desired_velocity = computeDesiredVelocity(carrot_pose, lookahead_yaw);
-  const double regulated_speed = std::hypot(desired_velocity.linear.x, desired_velocity.linear.y);
+  const geometry_msgs::msg::Twist desired_velocity = computeDesiredVelocity(
+    carrot_pose,
+    lookahead_yaw);
+  const double regulated_speed = computeRegulatedSpeed(
+    transformed_plan, feedback_speed, costAtPose(pose.pose.position.x, pose.pose.position.y));
   const DynamicWindowBounds3D dynamic_window = computeDynamicWindow(feedback_speed);
   const bool is_accel = shouldAccelerate(transformed_plan, feedback_speed);
 
-  const geometry_msgs::msg::Twist cmd_twist =
-    use_dynamic_window_vector_pursuit_ ?
-    computeOptimalVelocityWithinDynamicWindow(desired_velocity, dynamic_window, is_accel) :
-    desired_velocity;
+  const auto regulated_window = applyRegulationToDynamicWindow(dynamic_window, regulated_speed);
+  const double final_distance = std::hypot(
+    final_goal.pose.position.x, final_goal.pose.position.y);
+  const double final_yaw = angles::normalize_angle(tf2::getYaw(final_goal.pose.orientation));
+  const double yaw_tolerance =
+    goal_checker ? std::abs(tf2::getYaw(pose_tolerance.orientation)) : 0.0;
+  geometry_msgs::msg::Twist cmd_twist;
+  if (final_distance <= goal_dist_tol_ || maximumTranslationalSpeed() < 1e-12) {
+    cmd_twist = computeGoalVelocity(final_yaw, yaw_tolerance, regulated_window);
+  } else if (use_dynamic_window_vector_pursuit_) {
+    cmd_twist = computeOptimalVelocityWithinDynamicWindow(
+      desired_velocity, regulated_window, is_accel);
+  } else {
+    // Explicit clipped VP ablation: the same reference and feasible limits, without ray search.
+    cmd_twist = clipVelocityToBounds(desired_velocity, regulated_window);
+  }
 
   if (use_collision_detection_ && use_collision_detection_for_omni_) {
-    const double translational_speed = std::hypot(cmd_twist.linear.x, cmd_twist.linear.y);
     const double carrot_dist = std::hypot(carrot_pose.pose.position.x, carrot_pose.pose.position.y);
-    if (isCollisionImminent(
-        pose, translational_speed, cmd_twist.angular.z, carrot_dist))
-    {
-      throw nav2_core::PlannerException(
-              "DynamicWindowVectorPursuitController detected collision ahead.");
+    if (isCollisionImminentOmni(pose, cmd_twist, carrot_dist)) {
+      last_command_valid_ = false;
+      throw nav2_core::PlannerException("OmnidirectionalDWVPController detected collision ahead");
     }
   }
 
@@ -850,7 +999,7 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
     log_stamp = rclcpp::Clock(RCL_SYSTEM_TIME).now();
   }
   geometry_msgs::msg::PoseStamped pose_in_map;
-  const bool map_pose_valid = !csv_pose_frame_.empty() &&
+  const bool map_pose_valid = enable_csv_logging_ && !csv_pose_frame_.empty() &&
     nav2_util::transformPoseInTargetFrame(
     pose, pose_in_map, *tf_, csv_pose_frame_, costmap_ros_->getTransformTolerance());
   writeCsvLogLine(
@@ -870,11 +1019,12 @@ geometry_msgs::msg::TwistStamped DynamicWindowVectorPursuitController::computeVe
     constraints_violation);
 
   last_command_velocity_ = cmd_vel.twist;
+  last_command_valid_ = true;
   return cmd_vel;
 }
 
-}  // namespace nav2_dynamic_window_vector_pursuit_controller
+}  // namespace nav2_omnidirectional_dwvp_controller
 
 PLUGINLIB_EXPORT_CLASS(
-  nav2_dynamic_window_vector_pursuit_controller::DynamicWindowVectorPursuitController,
+  nav2_omnidirectional_dwvp_controller::OmnidirectionalDWVPController,
   nav2_core::Controller)

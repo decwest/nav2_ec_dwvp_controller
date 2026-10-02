@@ -1,0 +1,7 @@
+build/
+install/
+log/
+*.csv
+*.pyc
+__pycache__/
+*:Zone.Identifier

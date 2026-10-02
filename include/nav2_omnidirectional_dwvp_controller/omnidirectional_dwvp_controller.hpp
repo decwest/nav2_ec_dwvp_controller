@@ -12,21 +12,24 @@
 #include <fstream>
 #include <string>
 #include <tuple>
+#include <vector>
+
+#include "geometry_msgs/msg/pose2_d.hpp"
 
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "nav2_regulated_pure_pursuit_controller/regulated_pure_pursuit_controller.hpp"
 
-namespace nav2_dynamic_window_vector_pursuit_controller
+namespace nav2_omnidirectional_dwvp_controller
 {
 
-class DynamicWindowVectorPursuitController
+class OmnidirectionalDWVPController
   : public nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
 {
 public:
-  DynamicWindowVectorPursuitController() = default;
-  ~DynamicWindowVectorPursuitController() override = default;
+  OmnidirectionalDWVPController() = default;
+  ~OmnidirectionalDWVPController() override = default;
 
   void configure(
     const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
@@ -39,6 +42,8 @@ public:
     const geometry_msgs::msg::Twist & speed,
     nav2_core::GoalChecker * goal_checker) override;
   void setPlan(const nav_msgs::msg::Path & path) override;
+
+  void setSpeedLimit(const double & speed_limit, const bool & percentage) override;
 
   void activate() override;
   void deactivate() override;
@@ -56,7 +61,9 @@ protected:
   };
 
   double getLookAheadDistanceOmni(const geometry_msgs::msg::Twist & speed) const;
-  double computeLookAheadYaw(const nav_msgs::msg::Path & transformed_plan, double lookahead_dist) const;
+  double computeLookAheadYaw(
+    const nav_msgs::msg::Path & transformed_plan,
+    double lookahead_dist) const;
   double computeRemainingPathDistance(const nav_msgs::msg::Path & transformed_plan) const;
   bool shouldAccelerate(
     const nav_msgs::msg::Path & transformed_plan,
@@ -66,7 +73,22 @@ protected:
     const geometry_msgs::msg::PoseStamped & lookahead_pose,
     const double lookahead_yaw) const;
 
-  DynamicWindowBounds3D computeDynamicWindow(const geometry_msgs::msg::Twist & current_velocity) const;
+  DynamicWindowBounds3D computeDynamicWindow(const geometry_msgs::msg::Twist & current_velocity)
+  const;
+  double maximumTranslationalSpeed() const;
+  double computeRegulatedSpeed(
+    const nav_msgs::msg::Path & path, const geometry_msgs::msg::Twist & speed, double pose_cost);
+  DynamicWindowBounds3D applyRegulationToDynamicWindow(
+    const DynamicWindowBounds3D & physical_window, double regulated_speed) const;
+  geometry_msgs::msg::Twist computeGoalVelocity(
+    double yaw_error, double yaw_tolerance, const DynamicWindowBounds3D & window) const;
+  static std::vector<geometry_msgs::msg::Pose2D> projectMotion(
+    const geometry_msgs::msg::Pose2D & start, const geometry_msgs::msg::Twist & command,
+    double horizon, double carrot_distance, double resolution, double footprint_radius);
+  bool isCollisionImminentOmni(
+    const geometry_msgs::msg::PoseStamped & pose,
+    const geometry_msgs::msg::Twist & command, double carrot_distance);
+
   geometry_msgs::msg::Twist clipVelocityToBounds(
     const geometry_msgs::msg::Twist & velocity,
     const DynamicWindowBounds3D & bounds) const;
@@ -122,7 +144,7 @@ protected:
   double min_orientation_time_ {0.2};
   std::string velocity_feedback_ {"OPEN_LOOP"};
   bool use_dynamic_window_vector_pursuit_ {true};
-  bool use_collision_detection_for_omni_ {false};
+  bool use_collision_detection_for_omni_ {true};
   bool enable_csv_logging_ {false};
   std::string csv_log_directory_ {"/tmp"};
   std::string csv_filename_prefix_ {"dwvp_log"};
@@ -130,6 +152,7 @@ protected:
   bool csv_header_written_ {false};
   std::ofstream csv_stream_;
   geometry_msgs::msg::Twist last_command_velocity_;
+  bool last_command_valid_ {false};
 };
 
-}  // namespace nav2_dynamic_window_vector_pursuit_controller
+}  // namespace nav2_omnidirectional_dwvp_controller
