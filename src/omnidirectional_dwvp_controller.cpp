@@ -42,6 +42,16 @@ using nav2_util::declare_parameter_if_not_declared;
 
 namespace nav2_omnidirectional_dwvp_controller
 {
+namespace
+{
+double wrapOrientationError(double angle)
+{
+  const double wrapped = angles::normalize_angle(angle);
+  // Use [-pi, pi) for both lookahead and final-goal errors.
+  return wrapped == M_PI ? -M_PI : wrapped;
+}
+}  // namespace
+
 void OmnidirectionalDWVPController::configure(
   const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
   std::string name,
@@ -496,7 +506,7 @@ geometry_msgs::msg::Twist OmnidirectionalDWVPController::computeDesiredVelocity(
     distance / max_translational_speed : 0.0;
   const double orientation_time = std::max(
     min_orientation_time_, orientation_time_weight_ * position_time);
-  desired_velocity.angular.z = angles::normalize_angle(lookahead_yaw) / orientation_time;
+  desired_velocity.angular.z = wrapOrientationError(lookahead_yaw) / orientation_time;
 
   return desired_velocity;
 }
@@ -575,6 +585,7 @@ geometry_msgs::msg::Twist OmnidirectionalDWVPController::computeGoalVelocity(
   double yaw_error, double yaw_tolerance, const DynamicWindowBounds3D & window) const
 {
   geometry_msgs::msg::Twist target;
+  yaw_error = wrapOrientationError(yaw_error);
   if (std::abs(yaw_error) > yaw_tolerance) {
     target.angular.z = std::copysign(
       std::min(
@@ -966,7 +977,7 @@ geometry_msgs::msg::TwistStamped OmnidirectionalDWVPController::computeVelocityC
   const auto regulated_window = applyRegulationToDynamicWindow(dynamic_window, regulated_speed);
   const double final_distance = std::hypot(
     final_goal.pose.position.x, final_goal.pose.position.y);
-  const double final_yaw = angles::normalize_angle(tf2::getYaw(final_goal.pose.orientation));
+  const double final_yaw = tf2::getYaw(final_goal.pose.orientation);
   const double yaw_tolerance =
     goal_checker ? std::abs(tf2::getYaw(pose_tolerance.orientation)) : 0.0;
   geometry_msgs::msg::Twist cmd_twist;

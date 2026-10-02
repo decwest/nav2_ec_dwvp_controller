@@ -225,6 +225,27 @@ TEST(Solver, ZeroRayAndFiniteGoalRotation)
   EXPECT_THROW(c.computeDynamicWindow(twist(2, 0, 0)), std::exception);
 }
 
+TEST(Solver, AntipodalDesiredYawUsesNegativePi)
+{
+  TestController c;
+  geometry_msgs::msg::PoseStamped carrot;
+  for (const double yaw : {M_PI, -M_PI}) {
+    const auto desired = c.computeDesiredVelocity(carrot, yaw);
+    EXPECT_DOUBLE_EQ(desired.angular.z, -M_PI / 0.2);
+    EXPECT_DOUBLE_EQ(desired.linear.x, 0.0);
+    EXPECT_DOUBLE_EQ(desired.linear.y, 0.0);
+  }
+  carrot.pose.position.x = 0.3;
+  const auto positive = c.computeDesiredVelocity(carrot, M_PI);
+  const auto negative = c.computeDesiredVelocity(carrot, -M_PI);
+  EXPECT_DOUBLE_EQ(positive.angular.z, negative.angular.z);
+  EXPECT_LT(positive.angular.z, 0.0);
+  EXPECT_GT(positive.linear.x, 0.0);
+  // The convention changes the exact tie, not either neighboring direction.
+  EXPECT_GT(c.computeDesiredVelocity(carrot, M_PI - 1e-8).angular.z, 0.0);
+  EXPECT_LT(c.computeDesiredVelocity(carrot, -M_PI + 1e-8).angular.z, 0.0);
+}
+
 TEST(Solver, HolonomicProjection)
 {
   geometry_msgs::msg::Pose2D start;
@@ -305,6 +326,18 @@ TEST_F(ControllerTest, GoalOnlyRotationCommandsAndFiniteOutput)
   EXPECT_DOUBLE_EQ(u.linear.x, 0.0);
   EXPECT_DOUBLE_EQ(u.linear.y, 0.0);
   EXPECT_TRUE(std::isfinite(u.angular.z));
+}
+
+TEST_F(ControllerTest, AntipodalFinalGoalUsesNegativeTurn)
+{
+  for (const double yaw : {M_PI, -M_PI}) {
+    ctrl.setPlan(path(0, yaw));
+    const auto u = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
+    EXPECT_LT(u.angular.z, 0.0);
+    EXPECT_DOUBLE_EQ(u.linear.x, 0.0);
+    EXPECT_DOUBLE_EQ(u.linear.y, 0.0);
+    EXPECT_FALSE(ctrl.evaluateVelocityConstraints(u, twist(0, 0, 0)));
+  }
 }
 
 TEST_F(ControllerTest, LateralAndReverseFootprintCollision)
