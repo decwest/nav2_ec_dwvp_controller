@@ -29,10 +29,12 @@ controller_server:
       max_accel_x: 0.22
       max_accel_y: 0.22
       max_accel_theta: 0.6
+      vp_translation_speed: 0.0  # <= 0: inscribed planar speed
       orientation_time_weight: 1.0
       min_orientation_time: 0.2
       velocity_feedback: "OPEN_LOOP"
       use_dynamic_window_vector_pursuit: true
+      use_uniform_velocity_scaling: false  # VP_SCALED: set this true and DWVP false
       lookahead_dist: 0.11
       min_lookahead_dist: 0.11
       max_lookahead_dist: 0.33

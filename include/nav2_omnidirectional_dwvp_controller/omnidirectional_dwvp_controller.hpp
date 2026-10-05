@@ -64,11 +64,6 @@ protected:
   double computeLookAheadYaw(
     const nav_msgs::msg::Path & transformed_plan,
     double lookahead_dist) const;
-  double computeRemainingPathDistance(const nav_msgs::msg::Path & transformed_plan) const;
-  bool shouldAccelerate(
-    const nav_msgs::msg::Path & transformed_plan,
-    const geometry_msgs::msg::Twist & current_velocity) const;
-
   geometry_msgs::msg::Twist computeDesiredVelocity(
     const geometry_msgs::msg::PoseStamped & lookahead_pose,
     const double lookahead_yaw) const;
@@ -88,6 +83,10 @@ protected:
   bool isCollisionImminentOmni(
     const geometry_msgs::msg::PoseStamped & pose,
     const geometry_msgs::msg::Twist & command, double carrot_distance);
+
+  geometry_msgs::msg::Twist computeScaledVelocity(
+    const geometry_msgs::msg::Twist & desired, double regulated_speed,
+    const DynamicWindowBounds3D & dynamic_window) const;
 
   geometry_msgs::msg::Twist clipVelocityToBounds(
     const geometry_msgs::msg::Twist & velocity,
@@ -128,7 +127,6 @@ protected:
     double regulated_speed,
     double lookahead_dist,
     double lookahead_yaw,
-    bool is_accel,
     bool constraints_violation);
 
   double max_vel_x_ {0.6};
@@ -140,10 +138,12 @@ protected:
   double max_accel_x_ {1.0};
   double max_accel_y_ {1.0};
   double max_accel_theta_ {2.0};
+  double vp_translation_speed_ {0.0};
   double orientation_time_weight_ {1.0};
   double min_orientation_time_ {0.2};
   std::string velocity_feedback_ {"OPEN_LOOP"};
   bool use_dynamic_window_vector_pursuit_ {true};
+  bool use_uniform_velocity_scaling_ {false};
   bool use_collision_detection_for_omni_ {true};
   bool enable_csv_logging_ {false};
   std::string csv_log_directory_ {"/tmp"};

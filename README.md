@@ -48,10 +48,12 @@ limits that no acceleration-feasible command exists, the controller reports an
 error rather than returning a command that violates one of the limits.
 
 `v_box = hypot(max(abs(min_vel_x), abs(max_vel_x)),
-max(abs(min_vel_y), abs(max_vel_y)))` determines the VP reference direction.
+max(abs(min_vel_y), abs(max_vel_y)))` defines the enclosing translational speed.
+The VP demand magnitude is `vp_translation_speed`, with automatic inscribed-speed
+selection for values <= 0 (see below).
 Translation points toward the lookahead position. Reference yaw rate is the
 wrapped lookahead yaw error divided by
-`max(min_orientation_time, orientation_time_weight * distance / v_box)`;
+`max(min_orientation_time, orientation_time_weight * distance / vp_translation_speed_effective)`;
 the time floor also handles zero distance and a pure-rotation configuration.
 
 The inherited `desired_linear_vel` and Nav2 absolute/percentage speed limits
@@ -101,6 +103,7 @@ The corrected finite-distance/goal behavior still applies.
 | `min_orientation_time` | `0.2` | Positive minimum orientation time (s). |
 | `velocity_feedback` | `OPEN_LOOP` | Previous command, or measured velocity with `CLOSED_LOOP`. |
 | `use_dynamic_window_vector_pursuit` | `true` | Set false for component-clipped VP using the same regulated feasible box. |
+| `use_uniform_velocity_scaling` | `false` | With DWVP disabled, uniformly scale the VP demand to regulated velocity bounds before dynamic-window clipping. |
 | `use_collision_detection_for_omni` | `true` | Full holonomic footprint projection when inherited `use_collision_detection` is true. |
 | `enable_csv_logging` | `false` | Optional controller diagnostics. |
 | `csv_log_directory` | `/tmp` | Writable CSV destination. |
@@ -126,9 +129,14 @@ missed deadlines in experiments.
 
 Lookahead position uses Humble RPP's first outer point in a robot-centered
 lookahead circle, with optional circle/segment interpolation. Yaw uses the first
-outer pose quaternion. It is not recomputed from the tangent. The acceleration
-selection compares remaining polyline distance with translational stopping
-distance using `min(max_accel_x, max_accel_y)`.
+outer pose quaternion. It is not recomputed from the tangent. DWVP always selects
+the largest alpha at an intersection, or the closest point to the ray with
+larger alpha breaking equal-distance ties. Goal approach regulation narrows the
+translational window; terminal control handles final braking and yaw alignment.
+Keep `approach_velocity_scaling_dist > 0` for DWVP, clipped VP and uniformly scaled VP (the example
+and experiment profiles use 0.6 m). Disabling it can cause goal overshoot: the
+nominal straight-path Python model overshoots by about 0.09 m without it. This is
+simulation evidence, not a measured HSR stopping distance.
 
 ## Collision checking and recording
 
@@ -172,3 +180,52 @@ mount. Set `DWVP_VERIFY_WORKSPACE` to reuse its build artifacts. GitHub Actions
 builds and tests against the public `ros:humble-ros-base` image with rosdep.
 
 Licensed under [Apache License 2.0](LICENSE).
+
+### VP translation demand
+
+`vp_translation_speed` (double, m/s, default `0.0`) sets the translation
+magnitude in both the desired vector and the position-to-orientation travel
+time. A finite value <= 0 selects `min(max_vel_x, -min_vel_x, max_vel_y,
+-min_vel_y)`, including asymmetric reverse limits. A positive value is a demand,
+not an additional speed cap. It is read at configure time.
+
+DWVP selects on a ray and permits alpha > 1. Changing this
+magnitude preserves its output when the entire desired vector scales uniformly.
+Near the lookahead point, `min_orientation_time` can clamp angular demand; then
+translation changes without the same angular scaling, so the ray and DWVP output
+can change. The finite final-goal rotation branch is unchanged. The VP_CLIP
+comparison uses the existing component clipping branch, followed by the common
+external velocity smoother; clipping still uses the plugin's regulated window.
+
+The Python simulator uses the same positive-value meaning and default inscribed
+speed. Its explicit `0` means zero translation and negative values are rejected;
+this plugin follows the hardware contract of automatic selection for all <= 0.
+The simulator has not been modified.
+
+### Uniformly scaled VP comparison
+
+| Mode | `use_dynamic_window_vector_pursuit` | `use_uniform_velocity_scaling` |
+|---|---|---|
+| DWVP | true | false |
+| VP_CLIP | false | false |
+| VP_SCALED | false | true |
+
+Enabling both switches is rejected at configuration. VP_SCALED uses exactly the
+simulator's `vp_scaled` sequence: compute the common VP demand, choose the largest
+common multiplier in [0,1] that fits the **regulated physical velocity box**
+(cost/approach caps included, acceleration excluded), then clip each component
+to the same regulated dynamic window used by VP_CLIP/DWVP. A sudden cap may be
+unreachable; the common window retains its braking endpoint. Thus direction is
+preserved by the first scaling step, but subsequent acceleration clipping can
+change it. Final-goal handling is shared with VP_CLIP.
+
+`test/vp_scaled_cases.json` adds seven `compute_command(method='vp_scaled')`
+references from the unmodified simulator working tree, including angular
+saturation, half acceleration, cost/approach regulation and a sudden cap.
+`test/generate_vp_scaled_fixtures.py` regenerates them using the simulator's
+locked Python 3.11.11 environment (`uv run --offline --locked --python 3.11.11`)
+inside Docker with `--network none`, read-only simulator/source mounts and an
+output path under `/tmp`. The fixture records the simulator controller SHA-256.
+The existing `test/solver_cases.json` is unchanged. GTests additionally cover
+unchanged in-limit demand, a shared scale for angular saturation, 1000 random
+reachable-window checks, and identical clipped/scaled terminal commands.

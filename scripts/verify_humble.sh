@@ -7,6 +7,7 @@ mkdir -p "$verify_dir/src"
 image_name=${DWVP_HUMBLE_IMAGE:-docker-hsr:latest}
 docker run --rm --network none --user "$(id -u):$(id -g)" \
   -e HOME=/tmp -e ROS_HOME=/tmp/ros -e ROS_LOCALHOST_ONLY=1 \
+  -e ROS_DOMAIN_ID=179 -e PYTHONDONTWRITEBYTECODE=1 \
   -e AMENT_CPPCHECK_ALLOW_SLOW_VERSIONS=1 \
   --entrypoint bash \
   -v "$verify_dir:/ws" \

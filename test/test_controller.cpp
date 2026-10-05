@@ -23,6 +23,7 @@ public:
   using OmnidirectionalDWVPController::applyRegulationToDynamicWindow;
   using OmnidirectionalDWVPController::clipVelocityToBounds;
   using OmnidirectionalDWVPController::computeDesiredVelocity;
+  using OmnidirectionalDWVPController::computeScaledVelocity;
   using OmnidirectionalDWVPController::computeDynamicWindow;
   using OmnidirectionalDWVPController::computeGoalVelocity;
   using OmnidirectionalDWVPController::computeOptimalVelocityWithinDynamicWindow;
@@ -36,7 +37,14 @@ public:
   void cost(bool enable) {use_cost_regulated_linear_velocity_scaling_ = enable;}
   void approach(double distance) {approach_velocity_scaling_dist_ = distance;}
   void nominal(double value) {desired_linear_vel_ = base_desired_linear_vel_ = value;}
+  void translation(double value) {vp_translation_speed_ = value;}
+  void limits(double xmin, double xmax, double ymin, double ymax)
+  {
+    min_vel_x_ = xmin; max_vel_x_ = xmax; min_vel_y_ = ymin; max_vel_y_ = ymax;
+  }
+  void shortGoal() {goal_dist_tol_ = 0.01; max_accel_x_ = max_accel_y_ = 0.22;}
   void clipped(bool value) {use_dynamic_window_vector_pursuit_ = !value;}
+  void scaled(bool value) {use_uniform_velocity_scaling_ = value;}
   void feedback(const std::string & value) {velocity_feedback_ = value;}
   bool commandValid() const {return last_command_valid_;}
   void seed(const geometry_msgs::msg::Twist & value)
@@ -374,4 +382,120 @@ TEST_F(ControllerTest, PluginExportLoads)
   EXPECT_NE(
     loader.createSharedInstance(
       "nav2_omnidirectional_dwvp_controller::OmnidirectionalDWVPController"), nullptr);
+}
+
+TEST(Solver, DesiredTranslationSpeedAndOrientationTime)
+{
+  TestController c;
+  geometry_msgs::msg::PoseStamped target;
+  target.pose.position.x = 0.3;
+  target.pose.position.y = 0.4;
+  c.limits(-0.4, 0.6, -0.3, 0.5);
+  for (double setting : {0.0, -1.0, 0.2}) {
+    c.translation(setting);
+    const double speed = setting > 0.0 ? setting : 0.3;
+    const auto u = c.computeDesiredVelocity(target, 0.5);
+    EXPECT_NEAR(std::hypot(u.linear.x, u.linear.y), speed, 1e-12);
+    EXPECT_NEAR(u.angular.z, speed, 1e-12);
+  }
+}
+
+TEST(Solver, TranslationMagnitudePreservesRayExceptAtOrientationTimeFloor)
+{
+  TestController c;
+  geometry_msgs::msg::PoseStamped target;
+  target.pose.position.x = 0.5;
+  const auto b = c.computeDynamicWindow(twist(0.2, 0, 0.1));
+  c.translation(0.2);
+  const auto a = c.computeDesiredVelocity(target, 0.25);
+  c.translation(0.6);
+  const auto d = c.computeDesiredVelocity(target, 0.25);
+  const auto ua = c.computeOptimalVelocityWithinDynamicWindow(a, b, true);
+  const auto ud = c.computeOptimalVelocityWithinDynamicWindow(d, b, true);
+  EXPECT_NEAR(ua.linear.x, ud.linear.x, 1e-12);
+  EXPECT_NEAR(ua.angular.z, ud.angular.z, 1e-12);
+  EXPECT_GT(ua.linear.x / a.linear.x, 1.0);  // alpha is not capped at one
+  target.pose.position.x = 0.01;
+  c.translation(0.2);
+  const auto near_a = c.computeDesiredVelocity(target, 0.25);
+  c.translation(0.6);
+  const auto near_d = c.computeDesiredVelocity(target, 0.25);
+  EXPECT_DOUBLE_EQ(near_a.angular.z, near_d.angular.z);
+  EXPECT_NE(near_a.linear.x, near_d.linear.x);  // floor changes the ray direction
+}
+
+TEST_F(ControllerTest, FastestPointInsideStoppingDistance)
+{
+  ctrl.limits(-0.22, 0.22, -0.22, 0.22);
+  ctrl.shortGoal();
+  ctrl.setPlan(path(0.05));
+  const auto current = twist(0.22, 0.0, 0.0);
+  const auto u = ctrl.computeVelocityCommands(pose, current, nullptr).twist;
+  EXPECT_NEAR(u.linear.x, 0.22, 1e-12);
+  EXPECT_FALSE(ctrl.evaluateVelocityConstraints(u, current));
+  ctrl.approach(0.6);
+  ctrl.setPlan(path(0.05));
+  const auto regulated = ctrl.computeVelocityCommands(pose, current, nullptr).twist;
+  EXPECT_LT(regulated.linear.x, u.linear.x);
+  EXPECT_FALSE(ctrl.evaluateVelocityConstraints(regulated, current));
+}
+
+TEST(Solver, NonintersectionTiePrefersLargerAlpha)
+{
+  TestController c;
+  TestController::DynamicWindowBounds3D box {0.1, 0.3, 0.2, 0.4, 0.0, 0.0};
+  const auto u = c.computeOptimalVelocityWithinDynamicWindow(twist(1, 0, 0), box, true);
+  EXPECT_NEAR(u.linear.x, 0.3, 1e-12);
+  EXPECT_NEAR(u.linear.y, 0.2, 1e-12);
+}
+
+TEST(Solver, ScaledVpPreservesFeasibleDesiredAndUniformlyReducesAngularSaturation)
+{
+  TestController ctrl;
+  const TestController::DynamicWindowBounds3D bounds {-0.6, 0.6, -0.6, 0.6, -1.0, 1.0};
+  const auto desired = twist(0.2, -0.1, 0.3);
+  const auto clip = ctrl.clipVelocityToBounds(desired, bounds);
+  const auto scaled = ctrl.computeScaledVelocity(desired, ctrl.maximumTranslationalSpeed(), bounds);
+  EXPECT_DOUBLE_EQ(clip.linear.x, scaled.linear.x);
+  EXPECT_DOUBLE_EQ(clip.linear.y, scaled.linear.y);
+  EXPECT_DOUBLE_EQ(clip.angular.z, scaled.angular.z);
+  const auto limited = ctrl.computeScaledVelocity(
+    twist(0.2, -0.1, 2.0), ctrl.maximumTranslationalSpeed(), bounds);
+  EXPECT_DOUBLE_EQ(limited.linear.x, 0.1);
+  EXPECT_DOUBLE_EQ(limited.linear.y, -0.05);
+  EXPECT_DOUBLE_EQ(limited.angular.z, 1.0);
+}
+
+TEST(Solver, ScaledVpAlwaysUsesReachableWindowIncludingSuddenRegulation)
+{
+  TestController ctrl;
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<double> unit(-1.0, 1.0);
+  for (int i = 0; i < 1000; ++i) {
+    const auto current = twist(0.6 * unit(rng), 0.6 * unit(rng), unit(rng));
+    const double cap = 0.4 * (1.0 + unit(rng));
+    const auto box = ctrl.applyRegulationToDynamicWindow(ctrl.computeDynamicWindow(current), cap);
+    const auto command = ctrl.computeScaledVelocity(
+      twist(unit(rng), unit(rng), 3.0 * unit(rng)), cap, box);
+    EXPECT_FALSE(ctrl.evaluateVelocityConstraints(command, current));
+    EXPECT_GE(command.linear.x, box.min_vx);
+    EXPECT_LE(command.linear.x, box.max_vx);
+    EXPECT_GE(command.linear.y, box.min_vy);
+    EXPECT_LE(command.linear.y, box.max_vy);
+    EXPECT_GE(command.angular.z, box.min_w);
+    EXPECT_LE(command.angular.z, box.max_w);
+  }
+}
+
+TEST_F(ControllerTest, ScaledVpSharesClippedTerminalHandling)
+{
+  ctrl.clipped(true);
+  ctrl.setPlan(path(0.001, 0.9));
+  const auto clip = ctrl.computeVelocityCommands(pose, twist(0.1, -0.1, 0.2), nullptr).twist;
+  ctrl.scaled(true);
+  ctrl.setPlan(path(0.001, 0.9));
+  const auto scaled = ctrl.computeVelocityCommands(pose, twist(0.1, -0.1, 0.2), nullptr).twist;
+  EXPECT_DOUBLE_EQ(clip.linear.x, scaled.linear.x);
+  EXPECT_DOUBLE_EQ(clip.linear.y, scaled.linear.y);
+  EXPECT_DOUBLE_EQ(clip.angular.z, scaled.angular.z);
 }

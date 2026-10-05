@@ -75,6 +75,14 @@ if(BUILD_TESTING)
       $<TARGET_FILE:solver_fixture_runner> ${CMAKE_CURRENT_SOURCE_DIR}/test/solver_cases.json
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
   )
+  add_executable(vp_scaled_fixture_runner test/vp_scaled_fixture_runner.cpp)
+  target_link_libraries(vp_scaled_fixture_runner ${library_name})
+  ament_target_dependencies(vp_scaled_fixture_runner ${dependencies})
+  ament_add_test(vp_scaled_parity
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/check_solver_fixtures.py
+      $<TARGET_FILE:vp_scaled_fixture_runner> ${CMAKE_CURRENT_SOURCE_DIR}/test/vp_scaled_cases.json
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+  )
   ament_add_gtest(test_controller test/test_controller.cpp)
   target_link_libraries(test_controller ${library_name})
   ament_target_dependencies(test_controller ${dependencies})

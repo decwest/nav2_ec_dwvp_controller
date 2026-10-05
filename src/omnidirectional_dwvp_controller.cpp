@@ -69,6 +69,10 @@ void OmnidirectionalDWVPController::configure(
   const std::string default_csv_log_directory = "/tmp";
 
   declare_parameter_if_not_declared(
+    node.get(), name + ".vp_translation_speed", rclcpp::ParameterValue(0.0));
+  node->get_parameter(name + ".vp_translation_speed", vp_translation_speed_);
+
+  declare_parameter_if_not_declared(
     node.get(), name + ".max_vel_x",
     rclcpp::ParameterValue(0.6));
   declare_parameter_if_not_declared(
@@ -108,6 +112,8 @@ void OmnidirectionalDWVPController::configure(
     node.get(), name + ".use_dynamic_window_vector_pursuit",
     rclcpp::ParameterValue(true));
   declare_parameter_if_not_declared(
+    node.get(), name + ".use_uniform_velocity_scaling", rclcpp::ParameterValue(false));
+  declare_parameter_if_not_declared(
     node.get(), name + ".use_collision_detection_for_omni",
     rclcpp::ParameterValue(true));
   declare_parameter_if_not_declared(
@@ -138,6 +144,10 @@ void OmnidirectionalDWVPController::configure(
   node->get_parameter(
     name + ".use_dynamic_window_vector_pursuit",
     use_dynamic_window_vector_pursuit_);
+  node->get_parameter(name + ".use_uniform_velocity_scaling", use_uniform_velocity_scaling_);
+  if (use_uniform_velocity_scaling_ && use_dynamic_window_vector_pursuit_) {
+    throw std::invalid_argument("Uniform scaling requires use_dynamic_window_vector_pursuit=false");
+  }
   node->get_parameter(
     name + ".use_collision_detection_for_omni",
     use_collision_detection_for_omni_);
@@ -153,6 +163,7 @@ void OmnidirectionalDWVPController::configure(
   if (!valid_axis(min_vel_x_, max_vel_x_, max_accel_x_) ||
     !valid_axis(min_vel_y_, max_vel_y_, max_accel_y_) ||
     !valid_axis(min_vel_theta_, max_vel_theta_, max_accel_theta_) ||
+    !std::isfinite(vp_translation_speed_) ||
     !std::isfinite(orientation_time_weight_) || orientation_time_weight_ <= 0.0 ||
     !std::isfinite(min_orientation_time_) || min_orientation_time_ <= 0.0 ||
     !std::isfinite(control_duration_) || control_duration_ <= 0.0 ||
@@ -292,7 +303,6 @@ void OmnidirectionalDWVPController::writeCsvLogLine(
   double regulated_speed,
   double lookahead_dist,
   double lookahead_yaw,
-  bool is_accel,
   bool constraints_violation)
 {
   if (!enable_csv_logging_) {
@@ -312,7 +322,7 @@ void OmnidirectionalDWVPController::writeCsvLogLine(
       << "vx_real,vy_real,vx_now,vy_now,vx_cmd,vy_cmd,vx_nav,vy_nav,"
       << "velocity_violation,curvature,"
       << "dw_vx_max,dw_vx_min,dw_vy_max,dw_vy_min,dw_w_max,dw_w_min,"
-      << "v_reg,lookahead_dist,lookahead_yaw,is_accel\n";
+      << "v_reg,lookahead_dist,lookahead_yaw\n";
     csv_header_written_ = true;
   }
 
@@ -381,8 +391,7 @@ void OmnidirectionalDWVPController::writeCsvLogLine(
               << dynamic_window.min_w << ","
               << regulated_speed << ","
               << lookahead_dist << ","
-              << lookahead_yaw << ","
-              << (is_accel ? 1 : 0)
+              << lookahead_yaw
               << "\n";
   csv_stream_.flush();
 }
@@ -444,45 +453,6 @@ double OmnidirectionalDWVPController::computeLookAheadYaw(
     goal_pose_it->pose.position.x - prev_it->pose.position.x);
 }
 
-double OmnidirectionalDWVPController::computeRemainingPathDistance(
-  const nav_msgs::msg::Path & transformed_plan) const
-{
-  if (transformed_plan.poses.empty()) {
-    return 0.0;
-  }
-
-  double distance = std::hypot(
-    transformed_plan.poses.front().pose.position.x,
-    transformed_plan.poses.front().pose.position.y);
-
-  for (size_t i = 1; i < transformed_plan.poses.size(); ++i) {
-    const auto & p0 = transformed_plan.poses[i - 1].pose.position;
-    const auto & p1 = transformed_plan.poses[i].pose.position;
-    distance += std::hypot(p1.x - p0.x, p1.y - p0.y);
-  }
-
-  return distance;
-}
-
-bool OmnidirectionalDWVPController::shouldAccelerate(
-  const nav_msgs::msg::Path & transformed_plan,
-  const geometry_msgs::msg::Twist & current_velocity) const
-{
-  const double goal_distance = computeRemainingPathDistance(transformed_plan);
-  const double translational_speed =
-    std::hypot(current_velocity.linear.x, current_velocity.linear.y);
-  const double translational_accel_limit = std::min(max_accel_x_, max_accel_y_);
-
-  if (translational_accel_limit <= 1e-6) {
-    return false;
-  }
-
-  const double decel_distance =
-    (translational_speed * translational_speed) / (2.0 * translational_accel_limit);
-
-  return goal_distance > decel_distance;
-}
-
 geometry_msgs::msg::Twist OmnidirectionalDWVPController::computeDesiredVelocity(
   const geometry_msgs::msg::PoseStamped & lookahead_pose,
   const double lookahead_yaw) const
@@ -493,16 +463,16 @@ geometry_msgs::msg::Twist OmnidirectionalDWVPController::computeDesiredVelocity(
   const double dy = lookahead_pose.pose.position.y;
   const double distance = std::hypot(dx, dy);
 
-  const double vx_limit = std::max(std::abs(max_vel_x_), std::abs(min_vel_x_));
-  const double vy_limit = std::max(std::abs(max_vel_y_), std::abs(min_vel_y_));
-  const double max_translational_speed = std::hypot(vx_limit, vy_limit);
+  // Radius of the inscribed circle, including asymmetric reverse limits.
+  const double max_translational_speed = vp_translation_speed_ > 0.0 ?
+    vp_translation_speed_ : std::min({max_vel_x_, -min_vel_x_, max_vel_y_, -min_vel_y_});
 
-  if (distance > 1e-6 && max_translational_speed > 1e-6) {
+  if (distance > 1e-6) {
     desired_velocity.linear.x = max_translational_speed * dx / distance;
     desired_velocity.linear.y = max_translational_speed * dy / distance;
   }
 
-  const double position_time = max_translational_speed > 1e-6 ?
+  const double position_time = max_translational_speed > 1e-12 ?
     distance / max_translational_speed : 0.0;
   const double orientation_time = std::max(
     min_orientation_time_, orientation_time_weight_ * position_time);
@@ -660,6 +630,33 @@ bool OmnidirectionalDWVPController::isCollisionImminentOmni(
   }
   carrot_arc_pub_->publish(projected_path);
   return collision;
+}
+
+geometry_msgs::msg::Twist OmnidirectionalDWVPController::computeScaledVelocity(
+  const geometry_msgs::msg::Twist & desired, double regulated_speed,
+  const DynamicWindowBounds3D & dynamic_window) const
+{
+  // Scale against velocity limits only, then enforce the same reachable window
+  // as clipped VP (including retained braking endpoints after sudden caps).
+  const auto velocity_box = applyRegulationToDynamicWindow(
+    {min_vel_x_, max_vel_x_, min_vel_y_, max_vel_y_, min_vel_theta_, max_vel_theta_},
+    regulated_speed);
+  const std::array<double, 3> values {desired.linear.x, desired.linear.y, desired.angular.z};
+  const std::array<double, 3> lower {velocity_box.min_vx, velocity_box.min_vy, velocity_box.min_w};
+  const std::array<double, 3> upper {velocity_box.max_vx, velocity_box.max_vy, velocity_box.max_w};
+  double scale = 1.0;
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (values[i] > 0.0) {
+      scale = std::min(scale, upper[i] / values[i]);
+    } else if (values[i] < 0.0) {
+      scale = std::min(scale, lower[i] / values[i]);
+    }
+  }
+  geometry_msgs::msg::Twist target;
+  target.linear.x = scale * desired.linear.x;
+  target.linear.y = scale * desired.linear.y;
+  target.angular.z = scale * desired.angular.z;
+  return clipVelocityToBounds(target, dynamic_window);
 }
 
 geometry_msgs::msg::Twist OmnidirectionalDWVPController::clipVelocityToBounds(
@@ -972,7 +969,6 @@ geometry_msgs::msg::TwistStamped OmnidirectionalDWVPController::computeVelocityC
   const double regulated_speed = computeRegulatedSpeed(
     transformed_plan, feedback_speed, costAtPose(pose.pose.position.x, pose.pose.position.y));
   const DynamicWindowBounds3D dynamic_window = computeDynamicWindow(feedback_speed);
-  const bool is_accel = shouldAccelerate(transformed_plan, feedback_speed);
 
   const auto regulated_window = applyRegulationToDynamicWindow(dynamic_window, regulated_speed);
   const double final_distance = std::hypot(
@@ -985,7 +981,9 @@ geometry_msgs::msg::TwistStamped OmnidirectionalDWVPController::computeVelocityC
     cmd_twist = computeGoalVelocity(final_yaw, yaw_tolerance, regulated_window);
   } else if (use_dynamic_window_vector_pursuit_) {
     cmd_twist = computeOptimalVelocityWithinDynamicWindow(
-      desired_velocity, regulated_window, is_accel);
+      desired_velocity, regulated_window, true);
+  } else if (use_uniform_velocity_scaling_) {
+    cmd_twist = computeScaledVelocity(desired_velocity, regulated_speed, regulated_window);
   } else {
     // Explicit clipped VP ablation: the same reference and feasible limits, without ray search.
     cmd_twist = clipVelocityToBounds(desired_velocity, regulated_window);
@@ -1026,7 +1024,6 @@ geometry_msgs::msg::TwistStamped OmnidirectionalDWVPController::computeVelocityC
     regulated_speed,
     lookahead_dist,
     lookahead_yaw,
-    is_accel,
     constraints_violation);
 
   last_command_velocity_ = cmd_vel.twist;
