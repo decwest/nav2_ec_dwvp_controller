@@ -71,6 +71,9 @@ void OmnidirectionalDWVPController::configure(
   declare_parameter_if_not_declared(
     node.get(), name + ".vp_translation_speed", rclcpp::ParameterValue(0.0));
   node->get_parameter(name + ".vp_translation_speed", vp_translation_speed_);
+  declare_parameter_if_not_declared(
+    node.get(), name + ".lateral_time_constant", rclcpp::ParameterValue(0.0));
+  node->get_parameter(name + ".lateral_time_constant", lateral_time_constant_);
 
   declare_parameter_if_not_declared(
     node.get(), name + ".max_vel_x",
@@ -164,6 +167,7 @@ void OmnidirectionalDWVPController::configure(
     !valid_axis(min_vel_y_, max_vel_y_, max_accel_y_) ||
     !valid_axis(min_vel_theta_, max_vel_theta_, max_accel_theta_) ||
     !std::isfinite(vp_translation_speed_) ||
+    !std::isfinite(lateral_time_constant_) ||
     !std::isfinite(orientation_time_weight_) || orientation_time_weight_ <= 0.0 ||
     !std::isfinite(min_orientation_time_) || min_orientation_time_ <= 0.0 ||
     !std::isfinite(control_duration_) || control_duration_ <= 0.0 ||
@@ -235,6 +239,7 @@ void OmnidirectionalDWVPController::deactivate()
 void OmnidirectionalDWVPController::cleanup()
 {
   last_command_valid_ = false;
+  reference_plan_ = nav_msgs::msg::Path();
   rpp::RegulatedPurePursuitController::cleanup();
   closeCsvLogFile();
 }
@@ -243,6 +248,9 @@ void OmnidirectionalDWVPController::setPlan(const nav_msgs::msg::Path & path)
 {
   std::lock_guard<std::mutex> lock_reinit(mutex_);
   rpp::RegulatedPurePursuitController::setPlan(path);
+  if (lateral_time_constant_ > 0.0) {
+    reference_plan_ = path;
+  }
   // New plans may follow a stopped/cancelled goal. Seed from measured speed once.
   last_command_valid_ = false;
   if (!enable_csv_logging_) {
@@ -303,7 +311,8 @@ void OmnidirectionalDWVPController::writeCsvLogLine(
   double regulated_speed,
   double lookahead_dist,
   double lookahead_yaw,
-  bool constraints_violation)
+  bool constraints_violation,
+  const ResponseDiagnostics & response)
 {
   if (!enable_csv_logging_) {
     return;
@@ -322,7 +331,8 @@ void OmnidirectionalDWVPController::writeCsvLogLine(
       << "vx_real,vy_real,vx_now,vy_now,vx_cmd,vy_cmd,vx_nav,vy_nav,"
       << "velocity_violation,curvature,"
       << "dw_vx_max,dw_vx_min,dw_vy_max,dw_vy_min,dw_w_max,dw_w_min,"
-      << "v_reg,lookahead_dist,lookahead_yaw\n";
+      << "v_reg,lookahead_dist,lookahead_yaw,"
+      << "response_rule,lateral_error,chord_length,response_distance\n";
     csv_header_written_ = true;
   }
 
@@ -391,7 +401,11 @@ void OmnidirectionalDWVPController::writeCsvLogLine(
               << dynamic_window.min_w << ","
               << regulated_speed << ","
               << lookahead_dist << ","
-              << lookahead_yaw
+              << lookahead_yaw << ","
+              << response.rule << ","
+              << response.lateral_error << ","
+              << response.chord_length << ","
+              << response.response_distance
               << "\n";
   csv_stream_.flush();
 }
@@ -406,6 +420,20 @@ double OmnidirectionalDWVPController::getLookAheadDistanceOmni(
       lookahead_dist, min_lookahead_dist_, max_lookahead_dist_);
   }
   return lookahead_dist;
+}
+
+OmnidirectionalDWVPController::PreviewTarget
+OmnidirectionalDWVPController::computePreviewTarget(
+  const nav_msgs::msg::Path & plan,
+  double distance)
+{
+  const auto outer = std::find_if(
+    plan.poses.begin(), plan.poses.end(),
+    [&](const geometry_msgs::msg::PoseStamped & p) {
+      return std::hypot(p.pose.position.x, p.pose.position.y) >= distance;
+    });
+  return {getLookAheadPoint(distance, plan), computeLookAheadYaw(plan, distance),
+    outer == plan.poses.end(), outer == plan.poses.begin()};
 }
 
 double OmnidirectionalDWVPController::computeLookAheadYaw(
@@ -453,11 +481,73 @@ double OmnidirectionalDWVPController::computeLookAheadYaw(
     goal_pose_it->pose.position.x - prev_it->pose.position.x);
 }
 
+OmnidirectionalDWVPController::ReferenceProjection
+OmnidirectionalDWVPController::projectReference(
+  const nav_msgs::msg::Path & path, const geometry_msgs::msg::PoseStamped & pose)
+{
+  if (path.poses.empty()) {
+    throw nav2_core::PlannerException("Cannot project onto an empty reference plan");
+  }
+  const double px = pose.pose.position.x;
+  const double py = pose.pose.position.y;
+  ReferenceProjection result;
+  double rx = path.poses.front().pose.position.x;
+  double ry = path.poses.front().pose.position.y;
+  double best_distance = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i + 1 < path.poses.size(); ++i) {
+    const auto & a = path.poses[i].pose.position;
+    const auto & b = path.poses[i + 1].pose.position;
+    const double dx = b.x - a.x;
+    const double dy = b.y - a.y;
+    const double length2 = dx * dx + dy * dy;
+    const double q = length2 > 1e-20 ?
+      std::clamp(((px - a.x) * dx + (py - a.y) * dy) / length2, 0.0, 1.0) : 0.0;
+    const double x = a.x + q * dx;
+    const double y = a.y + q * dy;
+    const double distance2 = (px - x) * (px - x) + (py - y) * (py - y);
+    // Strict comparison retains the earliest segment, including duplicates.
+    if (distance2 < best_distance) {
+      best_distance = distance2;
+      rx = x;
+      ry = y;
+      result.segment = i;
+      result.fraction = q;
+    }
+  }
+  double tx = 1.0;
+  double ty = 0.0;
+  size_t nearest_index_distance = std::numeric_limits<size_t>::max();
+  for (size_t i = 0; i + 1 < path.poses.size(); ++i) {
+    const auto & a = path.poses[i].pose.position;
+    const auto & b = path.poses[i + 1].pose.position;
+    const double length = std::hypot(b.x - a.x, b.y - a.y);
+    const size_t index_distance = i > result.segment ? i - result.segment : result.segment - i;
+    if (length > 1e-10 && index_distance < nearest_index_distance) {
+      nearest_index_distance = index_distance;
+      tx = (b.x - a.x) / length;
+      ty = (b.y - a.y) / length;
+    }
+  }
+  result.lateral_error = -ty * (px - rx) + tx * (py - ry);
+  const double yaw = tf2::getYaw(pose.pose.orientation);
+  const double c = std::cos(yaw);
+  const double s = std::sin(yaw);
+  result.x = c * (rx - px) + s * (ry - py);
+  result.y = -s * (rx - px) + c * (ry - py);
+  result.tangent_x = c * tx + s * ty;
+  result.tangent_y = -s * tx + c * ty;
+  return result;
+}
+
 geometry_msgs::msg::Twist OmnidirectionalDWVPController::computeDesiredVelocity(
   const geometry_msgs::msg::PoseStamped & lookahead_pose,
-  const double lookahead_yaw) const
+  const double lookahead_yaw,
+  const ReferenceProjection * reference,
+  bool goal_region, bool nearest_target,
+  ResponseDiagnostics * diagnostics) const
 {
   geometry_msgs::msg::Twist desired_velocity;
+  ResponseDiagnostics response;
 
   const double dx = lookahead_pose.pose.position.x;
   const double dy = lookahead_pose.pose.position.y;
@@ -470,6 +560,46 @@ geometry_msgs::msg::Twist OmnidirectionalDWVPController::computeDesiredVelocity(
   if (distance > 1e-6) {
     desired_velocity.linear.x = max_translational_speed * dx / distance;
     desired_velocity.linear.y = max_translational_speed * dy / distance;
+  }
+
+  // Keep the original arithmetic above literally for every disabled setting.
+  if (lateral_time_constant_ > 0.0 && max_translational_speed > 0.0) {
+    if (!reference) {
+      throw std::invalid_argument("Lateral compensation requires a reference projection");
+    }
+    const double chord_x = dx - reference->x;
+    const double chord_y = dy - reference->y;
+    const double length = std::hypot(chord_x, chord_y);
+    const double response_distance = lateral_time_constant_ * max_translational_speed;
+    if (!std::isfinite(response_distance) || response_distance <= 0.0) {
+      throw std::invalid_argument("Lateral response distance must be finite and positive");
+    }
+    response.lateral_error = reference->lateral_error;
+    response.chord_length = length;
+    response.response_distance = response_distance;
+    double ux = dx;
+    double uy = dy;
+    if (goal_region && length < 1e-9) {
+      response.rule = "goal";
+    } else {
+      const bool tangent = length < 1e-9 || (!goal_region && nearest_target);
+      const double effective =
+        goal_region ? std::min(response_distance, length) : response_distance;
+      const double correction = reference->lateral_error / effective;
+      ux = (tangent ? reference->tangent_x : chord_x / length) +
+        correction * reference->tangent_y;
+      uy = (tangent ? reference->tangent_y : chord_y / length) -
+        correction * reference->tangent_x;
+      response.rule = goal_region ? "goal" : tangent ? "tangent" : "chord";
+    }
+    if (!(goal_region && distance <= 1e-6)) {
+      const double norm = std::hypot(ux, uy);
+      desired_velocity.linear.x = norm <= 1e-12 ? 0.0 : max_translational_speed * (ux / norm);
+      desired_velocity.linear.y = norm <= 1e-12 ? 0.0 : max_translational_speed * (uy / norm);
+    }
+  }
+  if (diagnostics) {
+    *diagnostics = response;
   }
 
   const double position_time = max_translational_speed > 1e-12 ?
@@ -938,6 +1068,15 @@ geometry_msgs::msg::TwistStamped OmnidirectionalDWVPController::computeVelocityC
     goal_dist_tol_ = pose_tolerance.position.x;
   }
 
+  ReferenceProjection reference;
+  if (lateral_time_constant_ > 0.0) {
+    geometry_msgs::msg::PoseStamped reference_pose;
+    if (!transformPose(reference_plan_.header.frame_id, pose, reference_pose)) {
+      throw nav2_core::PlannerException("Cannot transform pose into the reference plan frame");
+    }
+    // Preserve the incoming segment and all earlier ties across repeated RPP pruning.
+    reference = projectReference(reference_plan_, reference_pose);
+  }
   auto transformed_plan = transformGlobalPlan(pose);
   geometry_msgs::msg::PoseStamped final_goal;
   auto global_goal = global_plan_.poses.back();
@@ -954,7 +1093,8 @@ geometry_msgs::msg::TwistStamped OmnidirectionalDWVPController::computeVelocityC
 
 
   const double lookahead_dist = getLookAheadDistanceOmni(feedback_speed);
-  auto carrot_pose = getLookAheadPoint(lookahead_dist, transformed_plan);
+  const auto preview = computePreviewTarget(transformed_plan, lookahead_dist);
+  const auto & carrot_pose = preview.pose;
   carrot_pub_->publish(createCarrotMsg(carrot_pose));
   const double carrot_dist2 =
     (carrot_pose.pose.position.x * carrot_pose.pose.position.x) +
@@ -962,10 +1102,18 @@ geometry_msgs::msg::TwistStamped OmnidirectionalDWVPController::computeVelocityC
   const double curvature = (carrot_dist2 > 1e-9) ?
     (2.0 * carrot_pose.pose.position.y / carrot_dist2) : 0.0;
 
-  const double lookahead_yaw = computeLookAheadYaw(transformed_plan, lookahead_dist);
+  const double lookahead_yaw = preview.yaw;
+  bool goal_region = false;
+  bool nearest_target = false;
+  if (lateral_time_constant_ > 0.0) {
+    const auto & end = transformed_plan.poses.back().pose.position;
+    goal_region = preview.goal_region &&
+      std::hypot(end.x - final_goal.pose.position.x, end.y - final_goal.pose.position.y) < 1e-9;
+    nearest_target = preview.nearest_target;
+  }
+  ResponseDiagnostics response;
   const geometry_msgs::msg::Twist desired_velocity = computeDesiredVelocity(
-    carrot_pose,
-    lookahead_yaw);
+    carrot_pose, lookahead_yaw, &reference, goal_region, nearest_target, &response);
   const double regulated_speed = computeRegulatedSpeed(
     transformed_plan, feedback_speed, costAtPose(pose.pose.position.x, pose.pose.position.y));
   const DynamicWindowBounds3D dynamic_window = computeDynamicWindow(feedback_speed);
@@ -979,6 +1127,7 @@ geometry_msgs::msg::TwistStamped OmnidirectionalDWVPController::computeVelocityC
   geometry_msgs::msg::Twist cmd_twist;
   if (final_distance <= goal_dist_tol_ || maximumTranslationalSpeed() < 1e-12) {
     cmd_twist = computeGoalVelocity(final_yaw, yaw_tolerance, regulated_window);
+    response = ResponseDiagnostics();
   } else if (use_dynamic_window_vector_pursuit_) {
     cmd_twist = computeOptimalVelocityWithinDynamicWindow(
       desired_velocity, regulated_window, true);
@@ -1024,7 +1173,8 @@ geometry_msgs::msg::TwistStamped OmnidirectionalDWVPController::computeVelocityC
     regulated_speed,
     lookahead_dist,
     lookahead_yaw,
-    constraints_violation);
+    constraints_violation,
+    response);
 
   last_command_velocity_ = cmd_vel.twist;
   last_command_valid_ = true;

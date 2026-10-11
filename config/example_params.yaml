@@ -30,6 +30,9 @@ controller_server:
       max_accel_y: 0.22
       max_accel_theta: 0.6
       vp_translation_speed: 0.0  # <= 0: inscribed planar speed
+      # When enabled, choose tau >= max(v / (2 a_y), sigma_xy / (a_y dt)).
+      # Example: 0.75 s for v=0.22 m/s, a_y=0.22 m/s^2, sigma_xy=0.005 m, dt=1/30 s.
+      lateral_time_constant: 0.0  # seconds; <= 0 preserves the original VP law
       orientation_time_weight: 1.0
       min_orientation_time: 0.2
       velocity_feedback: "OPEN_LOOP"

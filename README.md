@@ -148,12 +148,18 @@ leaving costmap coverage is treated as a collision. This is a finite-horizon
 collision check, not a global obstacle-avoidance planner or braking-distance
 certificate.
 
-Optional CSV diagnostics retain the existing column schema. `dw_*` columns are
+Optional CSV diagnostics retain the existing columns and their order. `dw_*` columns are
 the original physical/acceleration window; `v_reg` is the requested scalar cap.
 `*_nav` columns are computed clipping estimates, **not observed downstream
 commands**. Use a common external recorder for raw controller output, actual
 smoothed output, measured odometry, reference poses, result status, and
 configuration/revision metadata when comparing different controllers.
+
+Four columns are appended: `response_rule` (`chord`, `tangent`, `goal`, or
+`inactive`), `lateral_error` (signed `e`, m), `chord_length` (`L_prime`, m), and
+`response_distance` (`D_y`, m). Inactive and terminal cycles report `nan` for
+these three geometry values. Compatibility with the external experiment
+reader has not been verified; readers must accept additional trailing columns.
 
 ## Verification
 
@@ -168,6 +174,15 @@ speed limits, goal-only rotation, lifecycle feedback, footprint collisions, and
 pluginlib loading. Shared fixtures in `test/solver_cases.json` also compare C++
 results with the Python simulator in
 [omnidirectional_dwvp](https://github.com/decwest/omnidirectional_dwvp).
+The `solver_parity` and `vp_scaled_parity` checks remain enabled.
+`desired_vector_parity` exercises the plugin's projection, Humble RPP preview,
+response-rule selection and desired velocity on all 192 cases in
+`test/desired_vector_cases.json`, copied unchanged from simulator commit
+`b09ba8e3a2a5feced5ba317adf793b0e33e69591`. It checks the selected target, nearest
+pose, goal-region flag, rule and body-frame demand with absolute and relative
+tolerances of `1e-9`. GTests also cover exact disabled-demand arithmetic,
+straight-path compensation, duplicate segments, retention across RPP pruning,
+and unchanged terminal commands in all three controller modes.
 
 For an existing Humble development image containing Nav2 and test dependencies:
 
@@ -201,6 +216,56 @@ The Python simulator uses the same positive-value meaning and default inscribed
 speed. Its explicit `0` means zero translation and negative values are rejected;
 this plugin follows the hardware contract of automatic selection for all <= 0.
 The simulator has not been modified.
+
+### Lateral response time
+
+`lateral_time_constant` (finite double, seconds, default `0.0`) is read at
+configure time. Values <= 0 preserve the original VP computation and commands.
+A positive value enables error compensation for DWVP, VP_CLIP and VP_SCALED,
+using `D_y = lateral_time_constant * v_vp`. Here `v_vp` is the demand magnitude
+from `vp_translation_speed`, or the inscribed speed when that parameter is <= 0.
+A zero demand keeps translation zero and compensation inactive.
+
+Let `p_r` be the closest-segment projection, `t_hat` its unit tangent,
+`n_hat = (-t_hat.y, t_hat.x)` its left normal, and
+`e = dot(n_hat, robot.xy - p_r)`. With the unchanged lookahead target `p_L`,
+`L_prime = norm(p_L - p_r)` and `c_hat = (p_L - p_r) / L_prime`, the demand is
+
+```text
+u = unit(c_hat - (e / D_y) * n_hat)
+(vx_des, vy_des) = v_vp * u   # expressed in the robot frame
+```
+
+On a straight path at small lateral error, this parameter is the first-order
+lateral-error time constant at the demand speed. Actual response also depends
+on the selected command and its limits. At an interior orthogonal projection,
+`D_y = L_prime` gives the original VP direction; this identity does not generally
+hold at a clamped endpoint with tangential error.
+
+Outside the goal preview region, a chord shorter than `1e-9` m or a preview
+selecting the nearest path pose uses `t_hat` in place of `c_hat`. If no retained
+pose reaches the lookahead radius and the retained path includes the actual
+plan end, the goal rule uses `min(D_y, L_prime)`. A vanishing goal chord instead
+aims directly at the target, keeping zero translation within `1e-6` m. A local
+costmap crop alone does not enter the goal rule. The angular demand still uses
+the robot-to-target distance and the original orientation time calculation.
+Terminal control inside the goal tolerance is unchanged.
+
+Projection searches the complete plan saved by `setPlan`, independently of
+RPP's pruned preview suffix. Thus the segment ending at the closest pose is
+retained even on subsequent cycles. Projection fractions are clamped to [0,1],
+and equal squared distances select the earliest segment, including duplicates.
+A duplicate inherits the nearest nonzero segment's tangent by index distance,
+with ties toward the earlier segment; a constant path uses the plan-frame +x
+direction. Geometry is projected in the plan frame, then expressed in the robot
+frame for the demand calculation.
+
+For tuning, start with a time constant at least
+`max(v_vp / (2 * a_y), sigma_xy / (a_y * dt))`, where `sigma_xy` is position-noise
+standard deviation and `dt` is the controller period. These are acceleration
+and noise estimates, not closed-loop guarantees. For example, `0.75` s exceeds
+both estimates at `v_vp = 0.22` m/s, `a_y = 0.22` m/s², `sigma_xy = 0.005` m and
+`dt = 1/30` s.
 
 ### Uniformly scaled VP comparison
 

@@ -83,6 +83,16 @@ if(BUILD_TESTING)
       $<TARGET_FILE:vp_scaled_fixture_runner> ${CMAKE_CURRENT_SOURCE_DIR}/test/vp_scaled_cases.json
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
   )
+  # Simulator b09ba8e3a2a5feced5ba317adf793b0e33e69591; fixture copied unchanged.
+  add_executable(desired_vector_fixture_runner test/desired_vector_fixture_runner.cpp)
+  target_link_libraries(desired_vector_fixture_runner ${library_name})
+  ament_target_dependencies(desired_vector_fixture_runner ${dependencies})
+  ament_add_test(desired_vector_parity
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/check_desired_vector_fixtures.py
+      $<TARGET_FILE:desired_vector_fixture_runner>
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/desired_vector_cases.json
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+  )
   ament_add_gtest(test_controller test/test_controller.cpp)
   target_link_libraries(test_controller ${library_name})
   ament_target_dependencies(test_controller ${dependencies})

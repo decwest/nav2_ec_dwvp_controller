@@ -10,6 +10,7 @@
 
 #include <array>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -50,6 +51,34 @@ public:
   void cleanup() override;
 
 protected:
+  struct ReferenceProjection
+  {
+    // Projection and inherited unit tangent in the robot frame; error is left-positive.
+    double x {0.0};
+    double y {0.0};
+    double tangent_x {1.0};
+    double tangent_y {0.0};
+    double lateral_error {0.0};
+    size_t segment {0};
+    double fraction {0.0};
+  };
+
+  struct ResponseDiagnostics
+  {
+    std::string rule {"inactive"};
+    double lateral_error {std::numeric_limits<double>::quiet_NaN()};
+    double chord_length {std::numeric_limits<double>::quiet_NaN()};
+    double response_distance {std::numeric_limits<double>::quiet_NaN()};
+  };
+
+  struct PreviewTarget
+  {
+    geometry_msgs::msg::PoseStamped pose;
+    double yaw;
+    bool goal_region;
+    bool nearest_target;
+  };
+
   struct DynamicWindowBounds3D
   {
     double min_vx;
@@ -61,12 +90,18 @@ protected:
   };
 
   double getLookAheadDistanceOmni(const geometry_msgs::msg::Twist & speed) const;
+  PreviewTarget computePreviewTarget(const nav_msgs::msg::Path & plan, double distance);
   double computeLookAheadYaw(
     const nav_msgs::msg::Path & transformed_plan,
     double lookahead_dist) const;
   geometry_msgs::msg::Twist computeDesiredVelocity(
     const geometry_msgs::msg::PoseStamped & lookahead_pose,
-    const double lookahead_yaw) const;
+    const double lookahead_yaw,
+    const ReferenceProjection * reference = nullptr,
+    bool goal_region = false, bool nearest_target = false,
+    ResponseDiagnostics * diagnostics = nullptr) const;
+  static ReferenceProjection projectReference(
+    const nav_msgs::msg::Path & path, const geometry_msgs::msg::PoseStamped & pose);
 
   DynamicWindowBounds3D computeDynamicWindow(const geometry_msgs::msg::Twist & current_velocity)
   const;
@@ -127,7 +162,8 @@ protected:
     double regulated_speed,
     double lookahead_dist,
     double lookahead_yaw,
-    bool constraints_violation);
+    bool constraints_violation,
+    const ResponseDiagnostics & response);
 
   double max_vel_x_ {0.6};
   double min_vel_x_ {-0.6};
@@ -139,6 +175,7 @@ protected:
   double max_accel_y_ {1.0};
   double max_accel_theta_ {2.0};
   double vp_translation_speed_ {0.0};
+  double lateral_time_constant_ {0.0};
   double orientation_time_weight_ {1.0};
   double min_orientation_time_ {0.2};
   std::string velocity_feedback_ {"OPEN_LOOP"};
@@ -153,6 +190,8 @@ protected:
   std::ofstream csv_stream_;
   geometry_msgs::msg::Twist last_command_velocity_;
   bool last_command_valid_ {false};
+  // RPP prunes its own plan to the nearest vertex. Projection needs the full polyline.
+  nav_msgs::msg::Path reference_plan_;
 };
 
 }  // namespace nav2_omnidirectional_dwvp_controller

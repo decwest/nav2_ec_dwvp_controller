@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "angles/angles.h"
 #include "nav2_omnidirectional_dwvp_controller/omnidirectional_dwvp_controller.hpp"
 #include "nav2_costmap_2d/costmap_filters/filter_values.hpp"
 #include "pluginlib/class_loader.hpp"
@@ -20,6 +22,7 @@ class TestController : public OmnidirectionalDWVPController
 {
 public:
   using OmnidirectionalDWVPController::DynamicWindowBounds3D;
+  using OmnidirectionalDWVPController::ResponseDiagnostics;
   using OmnidirectionalDWVPController::applyRegulationToDynamicWindow;
   using OmnidirectionalDWVPController::clipVelocityToBounds;
   using OmnidirectionalDWVPController::computeDesiredVelocity;
@@ -32,12 +35,27 @@ public:
   using OmnidirectionalDWVPController::isCollisionImminentOmni;
   using OmnidirectionalDWVPController::maximumTranslationalSpeed;
   using OmnidirectionalDWVPController::projectMotion;
+  using OmnidirectionalDWVPController::projectReference;
+  using OmnidirectionalDWVPController::computePreviewTarget;
 
   TestController() {control_duration_ = 0.05;}
   void cost(bool enable) {use_cost_regulated_linear_velocity_scaling_ = enable;}
   void approach(double distance) {approach_velocity_scaling_dist_ = distance;}
   void nominal(double value) {desired_linear_vel_ = base_desired_linear_vel_ = value;}
   void translation(double value) {vp_translation_speed_ = value;}
+  void lateralTime(double value) {lateral_time_constant_ = value;}
+  double lateralTime() const {return lateral_time_constant_;}
+  void previewDistance(double value)
+  {
+    lookahead_dist_ = value;
+    use_velocity_scaled_lookahead_dist_ = false;
+    use_interpolation_ = true;
+  }
+  auto retainedReference(const geometry_msgs::msg::PoseStamped & pose) const
+  {
+    return projectReference(reference_plan_, pose);
+  }
+  size_t prunedSize() const {return global_plan_.poses.size();}
   void limits(double xmin, double xmax, double ymin, double ymax)
   {
     min_vel_x_ = xmin; max_vel_x_ = xmax; min_vel_y_ = ymin; max_vel_y_ = ymax;
@@ -498,4 +516,254 @@ TEST_F(ControllerTest, ScaledVpSharesClippedTerminalHandling)
   EXPECT_DOUBLE_EQ(clip.linear.x, scaled.linear.x);
   EXPECT_DOUBLE_EQ(clip.linear.y, scaled.linear.y);
   EXPECT_DOUBLE_EQ(clip.angular.z, scaled.angular.z);
+}
+
+TEST(Solver, NonpositiveLateralTimePreservesLegacyDemandBits)
+{
+  TestController ctrl;
+  ctrl.limits(-0.4, 0.6, -0.3, 0.5);
+  for (double tau : {0.0, -0.5, -10.0}) {
+    ctrl.lateralTime(tau);
+    for (double setting : {0.0, -1.0, 0.22}) {
+      ctrl.translation(setting);
+      const double speed = setting > 0.0 ? setting : 0.3;
+      for (const auto & xy : std::vector<std::array<double, 2>>{
+        {0.3, 0.4}, {-0.2, 0.07}, {0.0, 0.0}, {1e-6, 0.0}, {0.0, -2e-6}})
+      {
+        geometry_msgs::msg::PoseStamped target;
+        target.pose.position.x = xy[0];
+        target.pose.position.y = xy[1];
+        for (double yaw : {-M_PI, 0.0, 0.73, M_PI}) {
+          geometry_msgs::msg::Twist legacy;
+          const double distance = std::hypot(xy[0], xy[1]);
+          if (distance > 1e-6) {
+            legacy.linear.x = speed * xy[0] / distance;
+            legacy.linear.y = speed * xy[1] / distance;
+          }
+          double wrapped = angles::normalize_angle(yaw);
+          if (wrapped == M_PI) {wrapped = -M_PI;}
+          legacy.angular.z = wrapped / std::max(0.2, distance / speed);
+          TestController::ResponseDiagnostics response;
+          const auto actual = ctrl.computeDesiredVelocity(
+            target, yaw, nullptr, true, true,
+            &response);
+          EXPECT_EQ(std::memcmp(&actual.linear.x, &legacy.linear.x, sizeof(double)), 0);
+          EXPECT_EQ(std::memcmp(&actual.linear.y, &legacy.linear.y, sizeof(double)), 0);
+          EXPECT_EQ(std::memcmp(&actual.angular.z, &legacy.angular.z, sizeof(double)), 0);
+          EXPECT_EQ(response.rule, "inactive");
+        }
+      }
+    }
+  }
+}
+
+TEST(Solver, LateralTimeGivesStraightPathIdentityAndUnchangedAngularDemand)
+{
+  TestController ctrl;
+  ctrl.limits(-0.4, 0.6, -0.3, 0.5);
+  for (double speed_setting : {0.0, 0.22}) {
+    ctrl.translation(speed_setting);
+    const double speed = speed_setting > 0.0 ? speed_setting : 0.3;
+    for (double error : {-0.5, -0.01, 0.01, 0.5}) {
+      auto reference_path = path(2.0);
+      for (auto & point : reference_path.poses) {
+        point.pose.position.x -= 0.83;
+        point.pose.position.y -= error;
+      }
+      geometry_msgs::msg::PoseStamped pose;
+      pose.pose.orientation.w = 1.0;
+      const auto reference = ctrl.projectReference(reference_path, pose);
+      ctrl.previewDistance(0.11);
+      auto suffix = reference_path;
+      suffix.poses.erase(suffix.poses.begin(), suffix.poses.begin() + 8);
+      const auto preview = ctrl.computePreviewTarget(suffix, 0.11);
+      ctrl.lateralTime(0.0);
+      const auto original = ctrl.computeDesiredVelocity(preview.pose, 0.7);
+      for (double tau : {0.75, 1.5}) {
+        ctrl.lateralTime(tau);
+        TestController::ResponseDiagnostics response;
+        const auto actual = ctrl.computeDesiredVelocity(
+          preview.pose, 0.7, &reference, preview.goal_region, preview.nearest_target, &response);
+        const double ratio = -error / (tau * speed);
+        EXPECT_NEAR(actual.linear.x, speed / std::hypot(1.0, ratio), 1e-12);
+        EXPECT_NEAR(actual.linear.y, speed * ratio / std::hypot(1.0, ratio), 1e-12);
+        EXPECT_EQ(actual.angular.z, original.angular.z);
+        EXPECT_NEAR(response.lateral_error, error, 1e-12);
+        EXPECT_NEAR(response.response_distance, tau * speed, 1e-12);
+        EXPECT_EQ(response.rule, std::abs(error) > 0.11 ? "tangent" : "chord");
+      }
+    }
+  }
+}
+
+TEST(Solver, ProjectionKeepsEarliestSegmentsAndInheritsDuplicateTangents)
+{
+  auto reference_path = path(0.0);
+  reference_path.poses.resize(4);
+  reference_path.poses[2].pose.position.y = 1.0;
+  reference_path.poses[3].pose.position.x = 1.0;
+  reference_path.poses[3].pose.position.y = 1.0;
+  geometry_msgs::msg::PoseStamped pose;
+  pose.pose.orientation.w = 1.0;
+  auto reference = TestController::projectReference(reference_path, pose);
+  EXPECT_EQ(reference.segment, 0u);  // Duplicate ties with the next segment.
+  EXPECT_EQ(reference.fraction, 0.0);
+  EXPECT_EQ(reference.tangent_x, 0.0);
+  EXPECT_EQ(reference.tangent_y, 1.0);
+  pose.pose.position.y = 0.4;
+  reference = TestController::projectReference(reference_path, pose);
+  EXPECT_EQ(reference.segment, 1u);
+  EXPECT_NEAR(reference.fraction, 0.4, 1e-12);
+  pose.pose.position.y = 1.0;
+  reference = TestController::projectReference(reference_path, pose);
+  EXPECT_EQ(reference.segment, 1u);  // Corner ties use the incoming tangent.
+  EXPECT_EQ(reference.tangent_y, 1.0);
+  pose.pose.orientation.z = std::sin(0.35);
+  pose.pose.orientation.w = std::cos(0.35);
+  reference = TestController::projectReference(path(0.0), pose);
+  EXPECT_NEAR(reference.tangent_x, std::cos(0.7), 1e-12);
+  EXPECT_NEAR(reference.tangent_y, -std::sin(0.7), 1e-12);
+  EXPECT_NEAR(reference.lateral_error, 1.0, 1e-12);
+  reference_path.poses.resize(1);
+  EXPECT_NO_THROW(TestController::projectReference(reference_path, pose));
+  reference_path.poses.clear();
+  EXPECT_THROW(TestController::projectReference(reference_path, pose), std::exception);
+}
+
+TEST(Solver, GoalResponseClampsDistanceAndPreservesZeroDistanceThreshold)
+{
+  TestController ctrl;
+  ctrl.translation(0.22);
+  ctrl.lateralTime(1.5);
+  geometry_msgs::msg::PoseStamped pose;
+  pose.pose.orientation.w = 1.0;
+  auto reference_path = path(0.08);
+  for (auto & point : reference_path.poses) {
+    point.pose.position.x -= 0.04;
+    point.pose.position.y = -0.03;
+  }
+  auto reference = ctrl.projectReference(reference_path, pose);
+  auto target = reference_path.poses.back();
+  TestController::ResponseDiagnostics response;
+  auto actual = ctrl.computeDesiredVelocity(target, 0.4, &reference, true, false, &response);
+  EXPECT_EQ(response.rule, "goal");
+  EXPECT_NEAR(response.chord_length, 0.04, 1e-12);
+  EXPECT_NEAR(actual.linear.x, 0.22 * 0.04 / 0.05, 1e-12);
+  EXPECT_NEAR(actual.linear.y, -0.22 * 0.03 / 0.05, 1e-12);
+  // Projection at the end: vanishing chord must aim back at the goal.
+  pose.pose.position.x = 0.1;
+  reference = ctrl.projectReference(reference_path, pose);
+  target.pose.position.x -= 0.1;
+  actual = ctrl.computeDesiredVelocity(target, 0.4, &reference, true, false, &response);
+  EXPECT_EQ(response.rule, "goal");
+  EXPECT_NEAR(actual.linear.x, -0.22 * 0.06 / std::hypot(0.06, 0.03), 1e-12);
+  EXPECT_NEAR(actual.linear.y, -0.22 * 0.03 / std::hypot(0.06, 0.03), 1e-12);
+  target.pose.position.x = 0.0;
+  target.pose.position.y = 1e-6;
+  actual = ctrl.computeDesiredVelocity(target, 0.4, &reference, true, false, &response);
+  EXPECT_EQ(actual.linear.x, 0.0);
+  EXPECT_EQ(actual.linear.y, 0.0);
+  EXPECT_NEAR(actual.angular.z, 2.0, 1e-12);
+  // A zero inscribed demand cannot define a positive response distance.
+  ctrl.translation(0.0);
+  ctrl.limits(0.0, 0.0, -0.2, 0.2);
+  actual = ctrl.computeDesiredVelocity(target, 0.4, &reference, false, false, &response);
+  EXPECT_EQ(actual.linear.x, 0.0);
+  EXPECT_EQ(actual.linear.y, 0.0);
+  EXPECT_EQ(response.rule, "inactive");
+}
+
+TEST_F(ControllerTest, CompensationRetainsIncomingSegmentAcrossPruning)
+{
+  ctrl.lateralTime(0.75);
+  ctrl.translation(0.22);
+  ctrl.previewDistance(0.3);
+  auto reference_path = path(2.0);
+  reference_path.poses = {
+    reference_path.poses.front(), reference_path.poses[10], reference_path.poses.back()};
+  for (auto & point : reference_path.poses) {
+    point.pose.position.x -= 0.8;
+    point.pose.position.y = -0.1;
+  }
+  ctrl.setPlan(reference_path);
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    const auto cmd = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
+    EXPECT_EQ(ctrl.prunedSize(), 2u);
+    const auto reference = ctrl.retainedReference(pose);
+    EXPECT_EQ(reference.segment, 0u);
+    EXPECT_NEAR(reference.fraction, 0.8, 1e-12);
+    EXPECT_NEAR(reference.x, 0.0, 1e-12);
+    EXPECT_NEAR(reference.y, -0.1, 1e-12);
+    EXPECT_LT(cmd.linear.y, 0.0);
+  }
+}
+
+TEST_F(ControllerTest, DisabledCommandsAndCompensatedTerminalCommandsAreIdentical)
+{
+  for (int mode = 0; mode < 3; ++mode) {
+    ctrl.clipped(mode != 0);
+    ctrl.scaled(mode == 2);
+    ctrl.lateralTime(0.0);
+    ctrl.setPlan(path(2.0, 0.7));
+    const auto baseline = ctrl.computeVelocityCommands(pose, twist(0.1, -0.1, 0.2), nullptr).twist;
+    ctrl.lateralTime(-0.75);
+    ctrl.setPlan(path(2.0, 0.7));
+    const auto disabled = ctrl.computeVelocityCommands(pose, twist(0.1, -0.1, 0.2), nullptr).twist;
+    EXPECT_EQ(baseline, disabled);
+    ctrl.lateralTime(0.0);
+    ctrl.setPlan(path(0.001, 0.9));
+    const auto terminal = ctrl.computeVelocityCommands(pose, twist(0.1, -0.1, 0.2), nullptr).twist;
+    ctrl.lateralTime(0.75);
+    ctrl.setPlan(path(0.001, 0.9));
+    const auto compensated =
+      ctrl.computeVelocityCommands(pose, twist(0.1, -0.1, 0.2), nullptr).twist;
+    EXPECT_EQ(terminal, compensated);
+  }
+}
+
+TEST_F(ControllerTest, LateralTimeIsReadAtConfigureAndRejectsNonfiniteValues)
+{
+  EXPECT_EQ(ctrl.lateralTime(), 0.0);
+  node->set_parameter(rclcpp::Parameter("FollowPath.lateral_time_constant", 0.75));
+  TestController configured;
+  configured.configure(node, "FollowPath", tf, map);
+  EXPECT_EQ(configured.lateralTime(), 0.75);
+  configured.cleanup();
+  node->set_parameter(
+    rclcpp::Parameter(
+      "FollowPath.lateral_time_constant", std::numeric_limits<double>::infinity()));
+  EXPECT_THROW(configured.configure(node, "FollowPath", tf, map), std::invalid_argument);
+  configured.cleanup();
+}
+
+TEST_F(ControllerTest, CompensatedCommandUsesRobotPoseInReferenceFrame)
+{
+  geometry_msgs::msg::TransformStamped transform;
+  transform.header.frame_id = "reference";
+  transform.child_frame_id = "base_link";
+  transform.transform.translation.x = 0.8;
+  transform.transform.translation.y = 0.1;
+  transform.transform.rotation.z = std::sin(0.35);
+  transform.transform.rotation.w = std::cos(0.35);
+  ASSERT_TRUE(tf->setTransform(transform, "test", true));
+  auto reference_path = path(2.0, 0.7);
+  reference_path.header.frame_id = "reference";
+  for (auto & point : reference_path.poses) {
+    point.header = reference_path.header;
+  }
+  ctrl.lateralTime(0.75);
+  ctrl.translation(0.22);
+  ctrl.clipped(true);
+  ctrl.previewDistance(0.3);
+  ctrl.setPlan(reference_path);
+  const double ratio = -0.1 / (0.75 * 0.22);
+  const double vx = 0.22 / std::hypot(1.0, ratio);
+  const double vy = vx * ratio;
+  const auto expected = twist(
+    std::cos(0.7) * vx + std::sin(0.7) * vy,
+    -std::sin(0.7) * vx + std::cos(0.7) * vy, 0.0);
+  const auto cmd = ctrl.computeVelocityCommands(pose, expected, nullptr).twist;
+  EXPECT_NEAR(cmd.linear.x, expected.linear.x, 1e-12);
+  EXPECT_NEAR(cmd.linear.y, expected.linear.y, 1e-12);
+  EXPECT_NEAR(cmd.angular.z, expected.angular.z, 1e-12);
 }
