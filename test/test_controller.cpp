@@ -12,31 +12,31 @@
 
 #include "gtest/gtest.h"
 #include "angles/angles.h"
-#include "nav2_omnidirectional_dwvp_controller/omnidirectional_dwvp_controller.hpp"
+#include "nav2_ec_dwvp_controller/ec_dwvp_controller.hpp"
 #include "nav2_costmap_2d/costmap_filters/filter_values.hpp"
 #include "pluginlib/class_loader.hpp"
 
-using nav2_omnidirectional_dwvp_controller::OmnidirectionalDWVPController;
+using nav2_ec_dwvp_controller::ECDWVPController;
 
-class TestController : public OmnidirectionalDWVPController
+class TestController : public ECDWVPController
 {
 public:
-  using OmnidirectionalDWVPController::DynamicWindowBounds3D;
-  using OmnidirectionalDWVPController::ResponseDiagnostics;
-  using OmnidirectionalDWVPController::applyRegulationToDynamicWindow;
-  using OmnidirectionalDWVPController::clipVelocityToBounds;
-  using OmnidirectionalDWVPController::computeDesiredVelocity;
-  using OmnidirectionalDWVPController::computeScaledVelocity;
-  using OmnidirectionalDWVPController::computeDynamicWindow;
-  using OmnidirectionalDWVPController::computeGoalVelocity;
-  using OmnidirectionalDWVPController::computeOptimalVelocityWithinDynamicWindow;
-  using OmnidirectionalDWVPController::computeRegulatedSpeed;
-  using OmnidirectionalDWVPController::evaluateVelocityConstraints;
-  using OmnidirectionalDWVPController::isCollisionImminentOmni;
-  using OmnidirectionalDWVPController::maximumTranslationalSpeed;
-  using OmnidirectionalDWVPController::projectMotion;
-  using OmnidirectionalDWVPController::projectReference;
-  using OmnidirectionalDWVPController::computePreviewTarget;
+  using ECDWVPController::DynamicWindowBounds3D;
+  using ECDWVPController::ResponseDiagnostics;
+  using ECDWVPController::applyRegulationToDynamicWindow;
+  using ECDWVPController::clipVelocityToBounds;
+  using ECDWVPController::computeDesiredVelocity;
+  using ECDWVPController::computeScaledVelocity;
+  using ECDWVPController::computeDynamicWindow;
+  using ECDWVPController::computeGoalVelocity;
+  using ECDWVPController::computeOptimalVelocityWithinDynamicWindow;
+  using ECDWVPController::computeRegulatedSpeed;
+  using ECDWVPController::evaluateVelocityConstraints;
+  using ECDWVPController::isCollisionImminentOmni;
+  using ECDWVPController::maximumTranslationalSpeed;
+  using ECDWVPController::projectMotion;
+  using ECDWVPController::projectReference;
+  using ECDWVPController::computePreviewTarget;
 
   TestController() {control_duration_ = 0.05;}
   void cost(bool enable) {use_cost_regulated_linear_velocity_scaling_ = enable;}
@@ -399,7 +399,7 @@ TEST_F(ControllerTest, PluginExportLoads)
   pluginlib::ClassLoader<nav2_core::Controller> loader("nav2_core", "nav2_core::Controller");
   EXPECT_NE(
     loader.createSharedInstance(
-      "nav2_omnidirectional_dwvp_controller::OmnidirectionalDWVPController"), nullptr);
+      "nav2_ec_dwvp_controller::ECDWVPController"), nullptr);
 }
 
 TEST(Solver, DesiredTranslationSpeedAndOrientationTime)

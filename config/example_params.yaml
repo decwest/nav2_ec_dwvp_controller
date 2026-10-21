@@ -18,7 +18,7 @@ controller_server:
       xy_goal_tolerance: 0.1
       yaw_goal_tolerance: 0.3
     FollowPath:
-      plugin: "nav2_omnidirectional_dwvp_controller::OmnidirectionalDWVPController"
+      plugin: "nav2_ec_dwvp_controller::ECDWVPController"
       desired_linear_vel: 0.32
       max_vel_x: 0.22
       min_vel_x: -0.22
@@ -32,7 +32,7 @@ controller_server:
       vp_translation_speed: 0.0  # <= 0: inscribed planar speed
       # When enabled, choose tau >= max(v / (2 a_y), sigma_xy / (a_y dt)).
       # Example: 0.75 s for v=0.22 m/s, a_y=0.22 m/s^2, sigma_xy=0.005 m, dt=1/30 s.
-      lateral_time_constant: 0.0  # seconds; <= 0 preserves the original VP law
+      lateral_time_constant: 0.75  # seconds; positive values enable error compensation
       orientation_time_weight: 1.0
       min_orientation_time: 0.2
       velocity_feedback: "OPEN_LOOP"

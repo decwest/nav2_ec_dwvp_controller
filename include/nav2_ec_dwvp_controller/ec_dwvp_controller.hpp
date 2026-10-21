@@ -22,15 +22,15 @@
 #include "nav_msgs/msg/path.hpp"
 #include "nav2_regulated_pure_pursuit_controller/regulated_pure_pursuit_controller.hpp"
 
-namespace nav2_omnidirectional_dwvp_controller
+namespace nav2_ec_dwvp_controller
 {
 
-class OmnidirectionalDWVPController
+class ECDWVPController
   : public nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
 {
 public:
-  OmnidirectionalDWVPController() = default;
-  ~OmnidirectionalDWVPController() override = default;
+  ECDWVPController() = default;
+  ~ECDWVPController() override = default;
 
   void configure(
     const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
@@ -194,4 +194,4 @@ protected:
   nav_msgs::msg::Path reference_plan_;
 };
 
-}  // namespace nav2_omnidirectional_dwvp_controller
+}  // namespace nav2_ec_dwvp_controller

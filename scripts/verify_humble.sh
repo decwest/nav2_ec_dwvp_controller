@@ -11,12 +11,12 @@ docker run --rm --network none --user "$(id -u):$(id -g)" \
   -e AMENT_CPPCHECK_ALLOW_SLOW_VERSIONS=1 \
   --entrypoint bash \
   -v "$verify_dir:/ws" \
-  -v "$repo_dir:/ws/src/nav2_omnidirectional_dwvp_controller:ro" \
+  -v "$repo_dir:/ws/src/nav2_ec_dwvp_controller:ro" \
   -w /ws "$image_name" -c '
     source /opt/ros/humble/setup.bash
-    colcon build --packages-select nav2_omnidirectional_dwvp_controller --cmake-args -DBUILD_TESTING=ON &&
+    colcon build --packages-select nav2_ec_dwvp_controller --cmake-args -DBUILD_TESTING=ON &&
     source install/setup.bash &&
-    colcon test --packages-select nav2_omnidirectional_dwvp_controller --return-code-on-test-failure &&
+    colcon test --packages-select nav2_ec_dwvp_controller --return-code-on-test-failure &&
     colcon test-result --verbose
   '
 printf 'Build and test artifacts: %s\n' "$verify_dir"

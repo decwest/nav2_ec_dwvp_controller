@@ -9,7 +9,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: src/nav2_omnidirectional_dwvp_controller
+          path: src/nav2_ec_dwvp_controller
       - name: Dependencies
         shell: bash
         run: |
@@ -25,7 +25,7 @@ jobs:
           AMENT_CPPCHECK_ALLOW_SLOW_VERSIONS: '1'
         run: |
           source /opt/ros/humble/setup.bash
-          colcon build --packages-select nav2_omnidirectional_dwvp_controller --cmake-args -DBUILD_TESTING=ON
+          colcon build --packages-select nav2_ec_dwvp_controller --cmake-args -DBUILD_TESTING=ON
           source install/setup.bash
-          colcon test --packages-select nav2_omnidirectional_dwvp_controller --return-code-on-test-failure
+          colcon test --packages-select nav2_ec_dwvp_controller --return-code-on-test-failure
           colcon test-result --verbose

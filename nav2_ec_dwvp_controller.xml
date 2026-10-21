@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<library path="nav2_ec_dwvp_controller">
+  <class
+    type="nav2_ec_dwvp_controller::ECDWVPController"
+    base_class_type="nav2_core::Controller">
+    <description>
+      Error-Compensated Dynamic Window Vector Pursuit controller for omnidirectional robots
+    </description>
+  </class>
+</library>

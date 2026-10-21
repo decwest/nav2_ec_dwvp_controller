@@ -41,7 +41,7 @@ controller_server:
     progress_checker_plugin: progress_checker
     controller_frequency: 30.0
     VP_CLIP:
-      plugin: nav2_omnidirectional_dwvp_controller::OmnidirectionalDWVPController
+      plugin: nav2_ec_dwvp_controller::ECDWVPController
       transform_tolerance: 0.1
       use_velocity_scaled_lookahead_dist: true
       use_collision_detection: true
@@ -78,7 +78,7 @@ controller_server:
       max_accel_theta: 0.6
       use_rotate_to_heading: false
     EC_DWVP:
-      plugin: nav2_omnidirectional_dwvp_controller::OmnidirectionalDWVPController
+      plugin: nav2_ec_dwvp_controller::ECDWVPController
       transform_tolerance: 0.1
       use_velocity_scaled_lookahead_dist: false
       use_collision_detection: true

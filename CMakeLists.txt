@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(nav2_omnidirectional_dwvp_controller)
+project(nav2_ec_dwvp_controller)
 
 find_package(ament_cmake REQUIRED)
 find_package(nav2_common REQUIRED)
@@ -36,10 +36,10 @@ set(dependencies
   tf2_geometry_msgs
 )
 
-set(library_name nav2_omnidirectional_dwvp_controller)
+set(library_name nav2_ec_dwvp_controller)
 
 add_library(${library_name} SHARED
-  src/omnidirectional_dwvp_controller.cpp
+  src/ec_dwvp_controller.cpp
 )
 
 ament_target_dependencies(${library_name}
@@ -58,10 +58,10 @@ install(DIRECTORY include/
 
 pluginlib_export_plugin_description_file(
   nav2_core
-  nav2_omnidirectional_dwvp_controller.xml
+  nav2_ec_dwvp_controller.xml
 )
 
-install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY config docs DESTINATION share/${PROJECT_NAME})
 install(FILES README.md LICENSE DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)

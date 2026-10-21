@@ -10,10 +10,10 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
-from omnidirectional_dwvp.config import Config
-from omnidirectional_dwvp.controller import compute_command
-from omnidirectional_dwvp.paths import orientation_ramp_path
-import omnidirectional_dwvp.controller as controller
+from ec_dwvp.config import Config
+from ec_dwvp.controller import compute_command
+from ec_dwvp.paths import orientation_ramp_path
+import ec_dwvp.controller as controller
 
 
 def main():
@@ -48,7 +48,7 @@ def main():
             expected_max=result.upper.tolist(), expected_command=result.command.tolist()))
     source = Path(controller.__file__)
     Path(sys.argv[1]).write_text(json.dumps(dict(
-        source=('omnidirectional_dwvp.controller.compute_command(method=vp_scaled), '
+        source=('ec_dwvp.controller.compute_command(method=vp_scaled), '
                 'uncommitted working tree'),
         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         path='orientation_ramp_path(0.3, length=2.5, start=1.0, spacing=0.01)',

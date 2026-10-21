@@ -7,10 +7,10 @@
 #include <iostream>
 #include <limits>
 
-#include "nav2_omnidirectional_dwvp_controller/omnidirectional_dwvp_controller.hpp"
+#include "nav2_ec_dwvp_controller/ec_dwvp_controller.hpp"
 
 class FixtureController
-  : public nav2_omnidirectional_dwvp_controller::OmnidirectionalDWVPController
+  : public nav2_ec_dwvp_controller::ECDWVPController
 {
 public:
   bool run(size_t count)
