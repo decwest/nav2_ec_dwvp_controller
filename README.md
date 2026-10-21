@@ -39,17 +39,17 @@ versions; a Jazzy or Rolling build is not claimed.
 ## Paper experiments
 
 The following files contain the controller-server, velocity-smoother and local-costmap
-settings from the recorded HSR experiments. Each file is directly under `config/`
-and is installed in the package share directory. Merge one file into your robot's
+settings from the recorded HSR experiments. The files are under `config/paper/`
+and are installed in the package share directory. Merge one file into your robot's
 Nav2 configuration and adapt the HSR topics and frames to your system.
 
 | Experiment | Parameter file | Conditions |
 |---|---|---|
-| 1a | [paper_experiment1a_params.yaml](config/paper_experiment1a_params.yaml) | EC-DWVP, L = 0.11 or 0.33 m and tau_y = 0.5 or 1.5 s |
-| 1b | [paper_experiment1b_a0p6_params.yaml](config/paper_experiment1b_a0p6_params.yaml) | Clipped VP, Scaled VP and EC-DWVP, x/y acceleration limit 0.22 m/s² and angular acceleration limit 0.6 rad/s² |
-| 1b | [paper_experiment1b_a0p3_params.yaml](config/paper_experiment1b_a0p3_params.yaml) | The same three methods, x/y acceleration limit 0.11 m/s² and angular acceleration limit 0.3 rad/s² |
-| 1b | [paper_experiment1b_a0p15_params.yaml](config/paper_experiment1b_a0p15_params.yaml) | The same three methods, x/y acceleration limit 0.055 m/s² and angular acceleration limit 0.15 rad/s² |
-| 2 | [paper_experiment2_params.yaml](config/paper_experiment2_params.yaml) | Clipped VP, EC-DWVP, MPPI and DWB on the indoor path |
+| 1a | [paper_experiment1a_params.yaml](config/paper/paper_experiment1a_params.yaml) | EC-DWVP, L = 0.11 or 0.33 m and tau_y = 0.5 or 1.5 s |
+| 1b | [paper_experiment1b_a0p6_params.yaml](config/paper/paper_experiment1b_a0p6_params.yaml) | Clipped VP, Scaled VP and EC-DWVP, x/y acceleration limit 0.22 m/s² and angular acceleration limit 0.6 rad/s² |
+| 1b | [paper_experiment1b_a0p3_params.yaml](config/paper/paper_experiment1b_a0p3_params.yaml) | The same three methods, x/y acceleration limit 0.11 m/s² and angular acceleration limit 0.3 rad/s² |
+| 1b | [paper_experiment1b_a0p15_params.yaml](config/paper/paper_experiment1b_a0p15_params.yaml) | The same three methods, x/y acceleration limit 0.055 m/s² and angular acceleration limit 0.15 rad/s² |
+| 2 | [paper_experiment2_params.yaml](config/paper/paper_experiment2_params.yaml) | Clipped VP, EC-DWVP, MPPI and DWB on the indoor path |
 
 Select a controller with `FollowPath.controller_id`. Experiment 1a provides four
 IDs, such as `EC_DWVP_L0p11_T0p5`. Experiment 1b provides `VP_CLIP`, `VP_SCALED`
