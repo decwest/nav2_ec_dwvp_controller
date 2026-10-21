@@ -36,6 +36,38 @@ yaw can differ from the path tangent. Commands are `geometry_msgs/TwistStamped`.
 Only Humble is supported and tested. RPP internal APIs differ in newer Nav2
 versions; a Jazzy or Rolling build is not claimed.
 
+## Paper experiments
+
+The following files contain the controller-server, velocity-smoother and local-costmap
+settings from the recorded HSR experiments. Each file is directly under `config/`
+and is installed in the package share directory. Merge one file into your robot's
+Nav2 configuration and adapt the HSR topics and frames to your system.
+
+| Experiment | Parameter file | Conditions |
+|---|---|---|
+| 1a | [paper_experiment1a_params.yaml](config/paper_experiment1a_params.yaml) | EC-DWVP, L = 0.11 or 0.33 m and tau_y = 0.5 or 1.5 s |
+| 1b | [paper_experiment1b_a0p6_params.yaml](config/paper_experiment1b_a0p6_params.yaml) | Clipped VP, Scaled VP and EC-DWVP, x/y acceleration limit 0.22 m/s² and angular acceleration limit 0.6 rad/s² |
+| 1b | [paper_experiment1b_a0p3_params.yaml](config/paper_experiment1b_a0p3_params.yaml) | The same three methods, x/y acceleration limit 0.11 m/s² and angular acceleration limit 0.3 rad/s² |
+| 1b | [paper_experiment1b_a0p15_params.yaml](config/paper_experiment1b_a0p15_params.yaml) | The same three methods, x/y acceleration limit 0.055 m/s² and angular acceleration limit 0.15 rad/s² |
+| 2 | [paper_experiment2_params.yaml](config/paper_experiment2_params.yaml) | Clipped VP, EC-DWVP, MPPI and DWB on the indoor path |
+
+Select a controller with `FollowPath.controller_id`. Experiment 1a provides four
+IDs, such as `EC_DWVP_L0p11_T0p5`. Experiment 1b provides `VP_CLIP`, `VP_SCALED`
+and `EC_DWVP`, with lateral compensation disabled for all three. Experiment 2
+provides `VP_CLIP`, `EC_DWVP`, `MPPI` and `DWB`. Use the matching Experiment 1b
+file for each acceleration condition so the controller and smoother limits agree.
+The path geometry and initial conditions are described in each file's header.
+
+The files load the controllers directly. The experiments used a timing wrapper
+that delegated to these same plugins with the same controller parameters.
+The wrapper and its experiment package are not needed to load these settings.
+Experiment 2 also requires the standard Nav2 MPPI and DWB packages and the
+[DWB path tracking critics](https://github.com/decwest/dwb_path_tracking_critics).
+Its DWB settings use the final position and orientation critic weights of 64 and
+16, respectively. Experiment 1 disables collision projection and cost-based speed
+regulation, as recorded in the tracking trials. Experiment 2 keeps collision
+projection enabled for Clipped VP and EC-DWVP.
+
 ## Motion and regulation
 
 The physical velocity box must contain zero on every axis. Each positive

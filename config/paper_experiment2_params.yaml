@@ -1,0 +1,336 @@
+# Experiment 2: Clipped VP, EC-DWVP, MPPI and DWB on the indoor reference path.
+# Path length approximately 7.5 m, corner radius 0.3 m, point spacing 0.02 m.
+# The path includes a 1.0 m shelf-facing section with 0.35 m transitions.
+# EC-DWVP: L = 0.11 m, tau_y = 0.6 s.
+# Clipped VP: lookahead time 0.75 s, distance bounds 0.11 to 0.33 m.
+# Acceleration limits: x/y = 0.22 m/s^2, angular = 0.6 rad/s^2.
+# MPPI and DWB use a 2.0 s prediction horizon.
+# DWB requires https://github.com/decwest/dwb_path_tracking_critics.
+# Merge these controller-server, velocity-smoother and local-costmap settings
+# into a complete ROS 2 Humble Nav2 configuration. Topics and frames are those
+# of the HSR experiment. Select a controller through FollowPath.controller_id.
+# Five trials were recorded for each method and condition.
+# Controllers are loaded directly instead of through the timing-only wrapper.
+# VP demand is 0.22 m/s: vp_translation_speed=0 selects the inscribed axis limit.
+# desired_linear_vel=0.32 is the separate regulation setting used in the runs.
+
+controller_server:
+  ros__parameters:
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    odom_topic: /omni_base_controller/wheel_odom
+    goal_checker_plugins:
+    - general_goal_checker
+    controller_plugins:
+    - VP_CLIP
+    - EC_DWVP
+    - MPPI
+    - DWB
+    speed_limit_topic: speed_limit
+    progress_checker:
+      plugin: nav2_controller::SimpleProgressChecker
+      required_movement_radius: 0.1
+      movement_time_allowance: 30.0
+    general_goal_checker:
+      stateful: false
+      plugin: nav2_controller::SimpleGoalChecker
+      xy_goal_tolerance: 0.1
+      yaw_goal_tolerance: 0.3
+    progress_checker_plugin: progress_checker
+    controller_frequency: 30.0
+    VP_CLIP:
+      plugin: nav2_omnidirectional_dwvp_controller::OmnidirectionalDWVPController
+      transform_tolerance: 0.1
+      use_velocity_scaled_lookahead_dist: true
+      use_collision_detection: true
+      orientation_time_weight: 1.0
+      lateral_time_constant: 0.0
+      min_orientation_time: 0.2
+      velocity_feedback: OPEN_LOOP
+      use_dynamic_window_vector_pursuit: false
+      use_collision_detection_for_omni: true
+      enable_csv_logging: false
+      use_cost_regulated_linear_velocity_scaling: false
+      use_regulated_linear_velocity_scaling: false
+      regulated_linear_scaling_min_speed: 0.05
+      approach_velocity_scaling_dist: 0.6
+      min_approach_linear_velocity: 0.05
+      cost_scaling_dist: 0.6
+      cost_scaling_gain: 1.0
+      inflation_cost_scaling_factor: 3.0
+      lookahead_time: 0.75
+      min_lookahead_dist: 0.11
+      max_lookahead_dist: 0.33
+      lookahead_dist: 0.11
+      max_angular_accel: 0.6
+      desired_linear_vel: 0.32
+      vp_translation_speed: 0.0
+      max_vel_x: 0.22
+      min_vel_x: -0.22
+      max_accel_x: 0.22
+      max_vel_y: 0.22
+      min_vel_y: -0.22
+      max_accel_y: 0.22
+      max_vel_theta: 0.6
+      min_vel_theta: -0.6
+      max_accel_theta: 0.6
+      use_rotate_to_heading: false
+    EC_DWVP:
+      plugin: nav2_omnidirectional_dwvp_controller::OmnidirectionalDWVPController
+      transform_tolerance: 0.1
+      use_velocity_scaled_lookahead_dist: false
+      use_collision_detection: true
+      orientation_time_weight: 1.0
+      lateral_time_constant: 0.6
+      min_orientation_time: 0.2
+      velocity_feedback: OPEN_LOOP
+      use_dynamic_window_vector_pursuit: true
+      use_collision_detection_for_omni: true
+      enable_csv_logging: false
+      use_cost_regulated_linear_velocity_scaling: false
+      use_regulated_linear_velocity_scaling: false
+      regulated_linear_scaling_min_speed: 0.05
+      approach_velocity_scaling_dist: 0.6
+      min_approach_linear_velocity: 0.05
+      cost_scaling_dist: 0.6
+      cost_scaling_gain: 1.0
+      inflation_cost_scaling_factor: 3.0
+      lookahead_time: 0.75
+      min_lookahead_dist: 0.11
+      max_lookahead_dist: 0.11
+      lookahead_dist: 0.11
+      max_angular_accel: 0.6
+      desired_linear_vel: 0.32
+      vp_translation_speed: 0.0
+      max_vel_x: 0.22
+      min_vel_x: -0.22
+      max_accel_x: 0.22
+      max_vel_y: 0.22
+      min_vel_y: -0.22
+      max_accel_y: 0.22
+      max_vel_theta: 0.6
+      min_vel_theta: -0.6
+      max_accel_theta: 0.6
+      use_rotate_to_heading: false
+    MPPI:
+      plugin: nav2_mppi_controller::MPPIController
+      motion_model: Omni
+      time_steps: 60
+      batch_size: 2000
+      iteration_count: 1
+      vx_std: 0.2
+      vy_std: 0.2
+      wz_std: 0.2
+      temperature: 0.2
+      gamma: 0.015
+      visualize: false
+      regenerate_noises: false
+      prune_distance: 1.7
+      transform_tolerance: 0.1
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      critics:
+      - ConstraintCritic
+      - CostCritic
+      - GoalCritic
+      - GoalAngleCritic
+      - PathAlignCritic
+      - PathFollowCritic
+      - PathAngleCritic
+      - PreferForwardCritic
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.81
+        critical_cost: 300.0
+        consider_footprint: false
+        collision_cost: 1000000.0
+        near_goal_distance: 1.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.0
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 30.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 13
+        use_path_orientations: true
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 10.0
+        offset_from_furthest: 13
+        threshold_to_consider: 1.0
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 6.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        forward_preference: true
+      PreferForwardCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.5
+      vx_max: 0.22
+      vx_min: -0.22
+      vy_max: 0.22
+      wz_max: 0.6
+      model_dt: 0.03333333333333333
+    DWB:
+      plugin: dwb_core::DWBLocalPlanner
+      trajectory_generator_name: dwb_plugins::LimitedAccelGenerator
+      discretize_by_time: false
+      time_granularity: 0.5
+      limit_vel_cmd_in_traj: false
+      debug_trajectory_details: false
+      min_speed_xy: 0.0
+      min_speed_theta: 0.0
+      vx_samples: 7
+      vy_samples: 7
+      vtheta_samples: 7
+      sim_time: 2.0
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.2
+      trans_stopped_velocity: 0.005
+      short_circuit_trajectory_evaluation: true
+      critics:
+      - Oscillation
+      - BaseObstacle
+      - ObstacleFootprint
+      - GoalDist
+      - GoalAlign
+      - RotateToGoal
+      - PathOrientationCritic
+      - PathPositionCritic
+      Oscillation.oscillation_reset_time: 1.0
+      BaseObstacle.scale: 0.02
+      GoalAlign.scale: 0.0
+      GoalAlign.forward_point_distance: 0.5
+      GoalDist.scale: 24.0
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+      min_vel_x: -0.22
+      max_vel_x: 0.22
+      min_vel_y: -0.22
+      max_vel_y: 0.22
+      max_vel_theta: 0.6
+      max_speed_xy: 0.22
+      sim_period: 0.03333333333333333
+      xy_goal_tolerance: 0.1
+      acc_lim_x: 0.22
+      decel_lim_x: -0.22
+      acc_lim_y: 0.22
+      decel_lim_y: -0.22
+      acc_lim_theta: 0.6
+      decel_lim_theta: -0.6
+      PathOrientationCritic.class: dwb_path_tracking_critics::PathOrientationCritic
+      PathOrientationCritic.scale: 16.0
+      PathOrientationCritic.aggregation: mean
+      PathPositionCritic.class: dwb_path_tracking_critics::PathPositionCritic
+      PathPositionCritic.scale: 64.0
+      PathPositionCritic.aggregation: mean
+      ObstacleFootprint.scale: 0.02
+velocity_smoother:
+  ros__parameters:
+    scale_velocities: false
+    feedback: OPEN_LOOP
+    odom_topic: /omni_base_controller/wheel_odom
+    odom_duration: 0.1
+    deadband_velocity:
+    - 0.0
+    - 0.0
+    - 0.0
+    velocity_timeout: 0.5
+    max_velocity:
+    - 0.22
+    - 0.22
+    - 0.6
+    min_velocity:
+    - -0.22
+    - -0.22
+    - -0.6
+    max_accel:
+    - 0.22
+    - 0.22
+    - 0.6
+    max_decel:
+    - -0.22
+    - -0.22
+    - -0.6
+    smoothing_frequency: 30.0
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 3
+      height: 3
+      resolution: 0.01
+      robot_radius: 0.22
+      plugins:
+      - static_layer
+      - voxel_layer
+      - inflation_layer
+      filters:
+      - keepout_filter
+      keepout_filter:
+        plugin: nav2_costmap_2d::KeepoutFilter
+        enabled: false
+        filter_info_topic: keepout_costmap_filter_info
+        override_lethal_cost: true
+        lethal_override_cost: 200
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.3
+      voxel_layer:
+        plugin: nav2_costmap_2d::VoxelLayer
+        enabled: true
+        combination_method: 1
+        publish_voxel_map: true
+        origin_z: 0.0
+        z_resolution: 0.05
+        z_voxels: 16
+        max_obstacle_height: 2.0
+        mark_threshold: 0
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: LaserScan
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+      static_layer:
+        plugin: nav2_costmap_2d::StaticLayer
+        map_subscribe_transient_local: true
+      always_send_full_costmap: true
+      introspection_mode: disabled
