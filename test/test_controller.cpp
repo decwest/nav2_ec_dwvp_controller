@@ -38,24 +38,32 @@ public:
   using ECDWVPController::projectReference;
   using ECDWVPController::computePreviewTarget;
 
-  TestController() {control_duration_ = 0.05;}
-  void cost(bool enable) {use_cost_regulated_linear_velocity_scaling_ = enable;}
-  void approach(double distance) {approach_velocity_scaling_dist_ = distance;}
-  void nominal(double value) {desired_linear_vel_ = base_desired_linear_vel_ = value;}
+  TestController()
+  {
+    control_duration_ = 0.05;
+    // Solver-only tests do not configure a ROS lifecycle node.
+    params_ = &test_parameters_;
+  }
+  nav2_regulated_pure_pursuit_controller::Parameters test_parameters_ {};
+  void cost(bool enable) {params_->use_cost_regulated_linear_velocity_scaling = enable;}
+  void approach(double distance) {params_->approach_velocity_scaling_dist = distance;}
+  void nominal(double value)
+  {
+    params_->desired_linear_vel = params_->base_desired_linear_vel = value;
+  }
   void translation(double value) {vp_translation_speed_ = value;}
   void lateralTime(double value) {lateral_time_constant_ = value;}
   double lateralTime() const {return lateral_time_constant_;}
   void previewDistance(double value)
   {
-    lookahead_dist_ = value;
-    use_velocity_scaled_lookahead_dist_ = false;
-    use_interpolation_ = true;
+    params_->lookahead_dist = value;
+    params_->use_velocity_scaled_lookahead_dist = false;
   }
   auto retainedReference(const geometry_msgs::msg::PoseStamped & pose) const
   {
     return projectReference(reference_plan_, pose);
   }
-  size_t prunedSize() const {return global_plan_.poses.size();}
+  size_t prunedSize() const {return path_handler_->getPlan().poses.size();}
   void limits(double xmin, double xmax, double ymin, double ymax)
   {
     min_vel_x_ = xmin; max_vel_x_ = xmax; min_vel_y_ = ymin; max_vel_y_ = ymax;
@@ -295,11 +303,14 @@ TEST_F(ControllerTest, CostApproachAndInheritedSpeedLimits)
   EXPECT_DOUBLE_EQ(ctrl.computeRegulatedSpeed(path(2), twist(0, 0, 0), 0), 0.6);
   ctrl.cost(true);
   const double radius = map->getLayeredCostmap()->getInscribedRadius();
-  const double cost = 252.0 * std::exp(-3.0 * (0.4 - radius));
+  // Jazzy RPP reconstructs distance with the inscribed-obstacle cost (253).
+  const double cost = nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE *
+    std::exp(-3.0 * (0.4 - radius));
   const double regulated = ctrl.computeRegulatedSpeed(path(2), twist(0, 0, 0), cost);
-  EXPECT_NEAR(regulated, 0.4, 1e-8);  // 0.6 nominal * 0.4 m / 0.6 m
+  // Jazzy uses log(253.0f), so its inverse cost conversion has float precision.
+  EXPECT_NEAR(regulated, 0.4, 1e-7);  // 0.6 nominal * 0.4 m / 0.6 m
   ctrl.approach(0.6);
-  EXPECT_NEAR(ctrl.computeRegulatedSpeed(path(0.3), twist(0, 0, 0), cost), 0.2, 1e-8);
+  EXPECT_NEAR(ctrl.computeRegulatedSpeed(path(0.3), twist(0, 0, 0), cost), 0.2, 1e-7);
   ctrl.cost(false);
   ctrl.approach(0.0);
   ctrl.setSpeedLimit(0.2, false);
@@ -766,4 +777,56 @@ TEST_F(ControllerTest, CompensatedCommandUsesRobotPoseInReferenceFrame)
   EXPECT_NEAR(cmd.linear.x, expected.linear.x, 1e-12);
   EXPECT_NEAR(cmd.linear.y, expected.linear.y, 1e-12);
   EXPECT_NEAR(cmd.angular.z, expected.angular.z, 1e-12);
+}
+
+TEST_F(ControllerTest, ResetAndCancelReseedMeasuredFeedback)
+{
+  ctrl.setPlan(path(2));
+  ctrl.seed(twist(0.5, 0.5, 0.5));
+  ctrl.reset();
+  EXPECT_FALSE(ctrl.commandValid());
+  auto command = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
+  EXPECT_FALSE(ctrl.evaluateVelocityConstraints(command, twist(0, 0, 0)));
+  ctrl.seed(twist(0.5, 0.5, 0.5));
+  EXPECT_TRUE(ctrl.cancel());
+  EXPECT_FALSE(ctrl.commandValid());
+  command = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
+  EXPECT_FALSE(ctrl.evaluateVelocityConstraints(command, twist(0, 0, 0)));
+  EXPECT_TRUE(ctrl.commandValid());
+}
+
+TEST_F(ControllerTest, LateralAndReversePathsPreserveRequestedHeading)
+{
+  auto lateral = path(2);
+  for (auto & point : lateral.poses) {
+    std::swap(point.pose.position.x, point.pose.position.y);
+  }
+  ctrl.setPlan(lateral);
+  auto command = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
+  EXPECT_GT(command.linear.y, 0.0);
+  EXPECT_NEAR(command.linear.x, 0.0, 1e-12);
+  EXPECT_NEAR(command.angular.z, 0.0, 1e-12);
+  ctrl.setPlan(path(-2));
+  command = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
+  EXPECT_LT(command.linear.x, 0.0);
+  EXPECT_NEAR(command.linear.y, 0.0, 1e-12);
+  EXPECT_NEAR(command.angular.z, 0.0, 1e-12);
+}
+
+TEST_F(ControllerTest, NestedPrimaryControllerReadsItsOwnParameters)
+{
+  const std::string name = "FollowPath.primary_controller";
+  node->declare_parameter(name + ".lateral_time_constant", 0.75);
+  node->declare_parameter(name + ".max_accel_x", 0.1);
+  node->declare_parameter(name + ".use_collision_detection", false);
+  node->declare_parameter(name + ".use_regulated_linear_velocity_scaling", false);
+  TestController primary;
+  primary.configure(node, name, tf, map);
+  EXPECT_DOUBLE_EQ(primary.lateralTime(), 0.75);
+  primary.activate();
+  primary.setPlan(path(2));
+  const auto command = primary.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
+  EXPECT_NEAR(command.linear.x, 0.1 / 20.0, 1e-12);
+  primary.deactivate();
+  primary.cleanup();
 }

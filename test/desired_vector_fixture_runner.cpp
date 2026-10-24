@@ -23,7 +23,6 @@ public:
     }
     lateral_time_constant_ = response_distance > 0.0 ?
       response_distance / vp_translation_speed_ : 0.0;
-    use_interpolation_ = true;
     geometry_msgs::msg::PoseStamped pose;
     pose.pose.position.x = px;
     pose.pose.position.y = py;

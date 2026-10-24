@@ -6,7 +6,7 @@
 # Acceleration limits: x/y = 0.055 m/s^2, angular = 0.15 rad/s^2.
 # Collision projection and cost-based speed regulation were disabled.
 # Merge these controller-server, velocity-smoother and local-costmap settings
-# into a complete ROS 2 Humble Nav2 configuration. Topics and frames are those
+# into a complete ROS 2 Jazzy Nav2 configuration. Topics and frames are those
 # of the HSR experiment. Select a controller through FollowPath.controller_id.
 # Five trials were recorded for each method and condition.
 # Controllers are loaded directly instead of through the timing-only wrapper.

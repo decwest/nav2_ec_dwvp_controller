@@ -7,7 +7,7 @@
 # MPPI and DWB use a 2.0 s prediction horizon.
 # DWB requires https://github.com/decwest/dwb_path_tracking_critics.
 # Merge these controller-server, velocity-smoother and local-costmap settings
-# into a complete ROS 2 Humble Nav2 configuration. Topics and frames are those
+# into a complete ROS 2 Jazzy Nav2 configuration. Topics and frames are those
 # of the HSR experiment. Select a controller through FollowPath.controller_id.
 # Five trials were recorded for each method and condition.
 # Controllers are loaded directly instead of through the timing-only wrapper.

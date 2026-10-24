@@ -9,11 +9,11 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
-import numpy as np
 from ec_dwvp.config import Config
+import ec_dwvp.controller as controller
 from ec_dwvp.controller import compute_command
 from ec_dwvp.paths import orientation_ramp_path
-import ec_dwvp.controller as controller
+import numpy as np
 
 
 def main():
@@ -40,19 +40,19 @@ def main():
             obstacles = [SimpleNamespace(x=1.12, y=.4, radius=.1)]
         result = compute_command(
             np.array(pose), np.array(current), path, arc, 'vp_scaled', config, obstacles)
-        cases.append(dict(
-            name=name, pose=pose, desired=result.desired.tolist(),
-            physical_min=config.lower.tolist(), physical_max=config.upper.tolist(),
-            acceleration=config.acceleration.tolist(), current=current, dt=config.dt,
-            cap=result.speed_cap, prefer_large=True, expected_min=result.lower.tolist(),
-            expected_max=result.upper.tolist(), expected_command=result.command.tolist()))
+        cases.append({
+            'name': name, 'pose': pose, 'desired': result.desired.tolist(),
+            'physical_min': config.lower.tolist(), 'physical_max': config.upper.tolist(),
+            'acceleration': config.acceleration.tolist(), 'current': current, 'dt': config.dt,
+            'cap': result.speed_cap, 'prefer_large': True, 'expected_min': result.lower.tolist(),
+            'expected_max': result.upper.tolist(), 'expected_command': result.command.tolist()})
     source = Path(controller.__file__)
-    Path(sys.argv[1]).write_text(json.dumps(dict(
-        source=('ec_dwvp.controller.compute_command(method=vp_scaled), '
-                'uncommitted working tree'),
-        source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
-        path='orientation_ramp_path(0.3, length=2.5, start=1.0, spacing=0.01)',
-        cases=cases), indent=2) + '\n')
+    Path(sys.argv[1]).write_text(json.dumps({
+        'source': ('ec_dwvp.controller.compute_command(method=vp_scaled), '
+                   'uncommitted working tree'),
+        'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+        'path': 'orientation_ramp_path(0.3, length=2.5, start=1.0, spacing=0.01)',
+        'cases': cases}, indent=2) + '\n')
 
 
 if __name__ == '__main__':

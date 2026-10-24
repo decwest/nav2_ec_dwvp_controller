@@ -24,13 +24,7 @@
 #include <vector>
 
 #include "angles/angles.h"
-#if __has_include("nav2_core/controller_exceptions.hpp")
 #include "nav2_core/controller_exceptions.hpp"
-#elif __has_include("nav2_core/exceptions.hpp")
-#include "nav2_core/exceptions.hpp"
-#else
-#error "Neither nav2_core/controller_exceptions.hpp nor nav2_core/exceptions.hpp was found."
-#endif
 #include "nav2_util/node_utils.hpp"
 #include "nav2_util/robot_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
@@ -171,10 +165,11 @@ void ECDWVPController::configure(
     !std::isfinite(orientation_time_weight_) || orientation_time_weight_ <= 0.0 ||
     !std::isfinite(min_orientation_time_) || min_orientation_time_ <= 0.0 ||
     !std::isfinite(control_duration_) || control_duration_ <= 0.0 ||
-    !std::isfinite(max_allowed_time_to_collision_up_to_carrot_) ||
-    max_allowed_time_to_collision_up_to_carrot_ < 0.0 ||
-    !std::isfinite(desired_linear_vel_) || desired_linear_vel_ < 0.0 ||
-    !std::isfinite(approach_velocity_scaling_dist_) || approach_velocity_scaling_dist_ < 0.0)
+    !std::isfinite(params_->max_allowed_time_to_collision_up_to_carrot) ||
+    params_->max_allowed_time_to_collision_up_to_carrot < 0.0 ||
+    !std::isfinite(params_->desired_linear_vel) || params_->desired_linear_vel < 0.0 ||
+    !std::isfinite(params_->approach_velocity_scaling_dist) ||
+    params_->approach_velocity_scaling_dist < 0.0)
   {
     throw std::invalid_argument("Invalid DWVP limits, control period, or orientation time");
   }
@@ -184,12 +179,18 @@ void ECDWVPController::configure(
   if (velocity_feedback_ != "OPEN_LOOP" && velocity_feedback_ != "CLOSED_LOOP") {
     throw std::invalid_argument("velocity_feedback must be OPEN_LOOP or CLOSED_LOOP");
   }
-  if (use_regulated_linear_velocity_scaling_) {
+  if (params_->use_regulated_linear_velocity_scaling) {
     RCLCPP_WARN(
       logger_,
       "DWVP supports cost and approach regulation; curvature regulation is unused.");
   }
   last_command_valid_ = false;
+  if (params_->use_cancel_deceleration) {
+    RCLCPP_WARN(logger_, "EC-DWVP cancels immediately; use_cancel_deceleration is unused.");
+  }
+  // Jazzy's RPP collision checker owns its arc publisher. EC-DWVP projects
+  // vx/vy/omega itself and therefore needs its own lifecycle publisher.
+  omni_arc_pub_ = node->create_publisher<nav_msgs::msg::Path>("lookahead_collision_arc", 1);
 
   if (enable_csv_logging_) {
     if (csv_log_directory_.empty()) {
@@ -219,7 +220,7 @@ void ECDWVPController::setSpeedLimit(
   if (!std::isfinite(speed_limit) || speed_limit < 0.0) {
     throw std::invalid_argument("Speed limit must be finite and nonnegative");
   }
-  std::lock_guard<std::mutex> lock_reinit(mutex_);
+  std::lock_guard<std::mutex> lock_reinit(controller_mutex_);
   rpp::RegulatedPurePursuitController::setSpeedLimit(speed_limit, percentage);
 }
 
@@ -227,11 +228,13 @@ void ECDWVPController::activate()
 {
   last_command_valid_ = false;
   rpp::RegulatedPurePursuitController::activate();
+  omni_arc_pub_->on_activate();
 }
 
 void ECDWVPController::deactivate()
 {
   last_command_valid_ = false;
+  omni_arc_pub_->on_deactivate();
   rpp::RegulatedPurePursuitController::deactivate();
   closeCsvLogFile();
 }
@@ -240,13 +243,18 @@ void ECDWVPController::cleanup()
 {
   last_command_valid_ = false;
   reference_plan_ = nav_msgs::msg::Path();
+  omni_arc_pub_.reset();
   rpp::RegulatedPurePursuitController::cleanup();
   closeCsvLogFile();
 }
 
 void ECDWVPController::setPlan(const nav_msgs::msg::Path & path)
 {
-  std::lock_guard<std::mutex> lock_reinit(mutex_);
+  std::lock_guard<std::mutex> lock_reinit(controller_mutex_);
+  if (path.poses.empty()) {
+    last_command_valid_ = false;
+    throw nav2_core::InvalidPath("EC-DWVP requires a nonempty path");
+  }
   rpp::RegulatedPurePursuitController::setPlan(path);
   if (lateral_time_constant_ > 0.0) {
     reference_plan_ = path;
@@ -257,6 +265,22 @@ void ECDWVPController::setPlan(const nav_msgs::msg::Path & path)
     return;
   }
   openNewCsvLogFile(rclcpp::Clock(RCL_SYSTEM_TIME).now());
+}
+
+void ECDWVPController::reset()
+{
+  std::lock_guard<std::mutex> lock(controller_mutex_);
+  last_command_valid_ = false;
+  rpp::RegulatedPurePursuitController::reset();
+}
+
+bool ECDWVPController::cancel()
+{
+  std::lock_guard<std::mutex> lock(controller_mutex_);
+  last_command_valid_ = false;
+  rpp::RegulatedPurePursuitController::reset();
+  // Nav2 emits the stop command; downstream smoothing controls deceleration.
+  return true;
 }
 
 void ECDWVPController::openNewCsvLogFile(const rclcpp::Time & stamp)
@@ -340,7 +364,7 @@ void ECDWVPController::writeCsvLogLine(
   const auto nsec = static_cast<uint32_t>(stamp.nanoseconds() % 1000000000LL);
   const auto compute_nav_axis =
     [&](double next_vel, double current_vel, double min_vel, double max_vel,
-      double max_accel) -> double
+    double max_accel) -> double
     {
       const double lower = std::max(current_vel - max_accel * control_duration_, min_vel);
       const double upper = std::min(current_vel + max_accel * control_duration_, max_vel);
@@ -413,11 +437,11 @@ void ECDWVPController::writeCsvLogLine(
 double ECDWVPController::getLookAheadDistanceOmni(
   const geometry_msgs::msg::Twist & speed) const
 {
-  double lookahead_dist = lookahead_dist_;
-  if (use_velocity_scaled_lookahead_dist_) {
-    lookahead_dist = std::hypot(speed.linear.x, speed.linear.y) * lookahead_time_;
+  double lookahead_dist = params_->lookahead_dist;
+  if (params_->use_velocity_scaled_lookahead_dist) {
+    lookahead_dist = std::hypot(speed.linear.x, speed.linear.y) * params_->lookahead_time;
     lookahead_dist = std::clamp(
-      lookahead_dist, min_lookahead_dist_, max_lookahead_dist_);
+      lookahead_dist, params_->min_lookahead_dist, params_->max_lookahead_dist);
   }
   return lookahead_dist;
 }
@@ -486,7 +510,7 @@ ECDWVPController::projectReference(
   const nav_msgs::msg::Path & path, const geometry_msgs::msg::PoseStamped & pose)
 {
   if (path.poses.empty()) {
-    throw nav2_core::PlannerException("Cannot project onto an empty reference plan");
+    throw nav2_core::NoValidControl("Cannot project onto an empty reference plan");
   }
   const double px = pose.pose.position.x;
   const double py = pose.pose.position.y;
@@ -628,7 +652,7 @@ ECDWVPController::computeDynamicWindow(
   if (bounds.min_vx > bounds.max_vx || bounds.min_vy > bounds.max_vy ||
     bounds.min_w > bounds.max_w)
   {
-    throw nav2_core::PlannerException(
+    throw nav2_core::NoValidControl(
             "Velocity feedback has no acceleration-feasible velocity window");
   }
 
@@ -646,9 +670,9 @@ double ECDWVPController::computeRegulatedSpeed(
   const nav_msgs::msg::Path & path, const geometry_msgs::msg::Twist & speed,
   double pose_cost)
 {
-  const double nominal = std::min(maximumTranslationalSpeed(), desired_linear_vel_);
+  const double nominal = std::min(maximumTranslationalSpeed(), params_->desired_linear_vel);
   if (!std::isfinite(nominal) || nominal < 0.0) {
-    throw nav2_core::PlannerException("Invalid nominal speed");
+    throw nav2_core::NoValidControl("Invalid nominal speed");
   }
   double regulated = nominal;
   double sign = 1.0;
@@ -741,7 +765,7 @@ bool ECDWVPController::isCollisionImminentOmni(
   nav_msgs::msg::Path projected_path;
   projected_path.header = pose.header;
   const auto samples = projectMotion(
-    start, command, max_allowed_time_to_collision_up_to_carrot_, carrot_distance,
+    start, command, params_->max_allowed_time_to_collision_up_to_carrot, carrot_distance,
     costmap_->getResolution(), costmap_ros_->getLayeredCostmap()->getCircumscribedRadius());
   bool collision = false;
   for (const auto & p : samples) {
@@ -753,12 +777,14 @@ bool ECDWVPController::isCollisionImminentOmni(
     sample.pose.orientation.w = std::cos(p.theta / 2.0);
     projected_path.poses.push_back(sample);
     unsigned int mx, my;
-    if (!costmap_->worldToMap(p.x, p.y, mx, my) || inCollision(p.x, p.y, p.theta)) {
+    if (!costmap_->worldToMap(p.x, p.y, mx, my) || collision_checker_->inCollision(p.x, p.y,
+        p.theta))
+    {
       collision = true;
       break;
     }
   }
-  carrot_arc_pub_->publish(projected_path);
+  omni_arc_pub_->publish(projected_path);
   return collision;
 }
 
@@ -1016,7 +1042,7 @@ bool ECDWVPController::evaluateVelocityConstraints(
   const double dt = control_duration_;
 
   auto violates_axis_constraints = [&](double next_vel, double current_vel,
-      double min_vel, double max_vel, double max_accel) -> bool
+    double min_vel, double max_vel, double max_accel) -> bool
     {
       const double lower = std::max(current_vel - max_accel * dt, min_vel);
       const double upper = std::min(current_vel + max_accel * dt, max_vel);
@@ -1043,7 +1069,8 @@ geometry_msgs::msg::TwistStamped ECDWVPController::computeVelocityCommands(
   const geometry_msgs::msg::Twist & speed,
   nav2_core::GoalChecker * goal_checker)
 {
-  std::lock_guard<std::mutex> lock_reinit(mutex_);
+  std::lock_guard<std::mutex> lock_reinit(controller_mutex_);
+  std::lock_guard<std::mutex> lock_params(param_handler_->getMutex());
 
   const geometry_msgs::msg::Twist feedback_speed =
     (velocity_feedback_ == "CLOSED_LOOP" || !last_command_valid_) ? speed : last_command_velocity_;
@@ -1052,7 +1079,7 @@ geometry_msgs::msg::TwistStamped ECDWVPController::computeVelocityCommands(
   if (!std::isfinite(feedback_speed.linear.x) || !std::isfinite(feedback_speed.linear.y) ||
     !std::isfinite(feedback_speed.angular.z))
   {
-    throw nav2_core::PlannerException("Non-finite velocity feedback");
+    throw nav2_core::NoValidControl("Non-finite velocity feedback");
   }
 
 
@@ -1071,23 +1098,26 @@ geometry_msgs::msg::TwistStamped ECDWVPController::computeVelocityCommands(
   ReferenceProjection reference;
   if (lateral_time_constant_ > 0.0) {
     geometry_msgs::msg::PoseStamped reference_pose;
-    if (!transformPose(reference_plan_.header.frame_id, pose, reference_pose)) {
-      throw nav2_core::PlannerException("Cannot transform pose into the reference plan frame");
+    if (!path_handler_->transformPose(reference_plan_.header.frame_id, pose, reference_pose)) {
+      throw nav2_core::ControllerTFError("Cannot transform pose into the reference plan frame");
     }
     // Preserve the incoming segment and all earlier ties across repeated RPP pruning.
     reference = projectReference(reference_plan_, reference_pose);
   }
-  auto transformed_plan = transformGlobalPlan(pose);
+  auto transformed_plan = path_handler_->transformGlobalPlan(
+    pose, params_->max_robot_pose_search_dist);
+  global_path_pub_->publish(transformed_plan);
+  const auto global_plan = path_handler_->getPlan();
   geometry_msgs::msg::PoseStamped final_goal;
-  auto global_goal = global_plan_.poses.back();
-  global_goal.header.frame_id = global_plan_.header.frame_id;
+  auto global_goal = global_plan.poses.back();
+  global_goal.header.frame_id = global_plan.header.frame_id;
   global_goal.header.stamp = pose.header.stamp;
-  if (!transformPose(costmap_ros_->getBaseFrameID(), global_goal, final_goal)) {
-    throw nav2_core::PlannerException("Cannot transform final goal");
+  if (!path_handler_->transformPose(costmap_ros_->getBaseFrameID(), global_goal, final_goal)) {
+    throw nav2_core::ControllerTFError("Cannot transform final goal");
   }
 
   if (transformed_plan.poses.empty()) {
-    throw nav2_core::PlannerException(
+    throw nav2_core::NoValidControl(
             "ECDWVPController: transformed plan is empty.");
   }
 
@@ -1115,7 +1145,8 @@ geometry_msgs::msg::TwistStamped ECDWVPController::computeVelocityCommands(
   const geometry_msgs::msg::Twist desired_velocity = computeDesiredVelocity(
     carrot_pose, lookahead_yaw, &reference, goal_region, nearest_target, &response);
   const double regulated_speed = computeRegulatedSpeed(
-    transformed_plan, feedback_speed, costAtPose(pose.pose.position.x, pose.pose.position.y));
+    transformed_plan, feedback_speed,
+      collision_checker_->costAtPose(pose.pose.position.x, pose.pose.position.y));
   const DynamicWindowBounds3D dynamic_window = computeDynamicWindow(feedback_speed);
 
   const auto regulated_window = applyRegulationToDynamicWindow(dynamic_window, regulated_speed);
@@ -1138,11 +1169,11 @@ geometry_msgs::msg::TwistStamped ECDWVPController::computeVelocityCommands(
     cmd_twist = clipVelocityToBounds(desired_velocity, regulated_window);
   }
 
-  if (use_collision_detection_ && use_collision_detection_for_omni_) {
+  if (params_->use_collision_detection && use_collision_detection_for_omni_) {
     const double carrot_dist = std::hypot(carrot_pose.pose.position.x, carrot_pose.pose.position.y);
     if (isCollisionImminentOmni(pose, cmd_twist, carrot_dist)) {
       last_command_valid_ = false;
-      throw nav2_core::PlannerException("ECDWVPController detected collision ahead");
+      throw nav2_core::NoValidControl("ECDWVPController detected collision ahead");
     }
   }
 

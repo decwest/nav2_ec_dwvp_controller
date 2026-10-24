@@ -11,6 +11,7 @@
 #include <array>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -49,6 +50,8 @@ public:
   void activate() override;
   void deactivate() override;
   void cleanup() override;
+  void reset() override;
+  bool cancel() override;
 
 protected:
   struct ReferenceProjection
@@ -164,6 +167,9 @@ protected:
     double lookahead_yaw,
     bool constraints_violation,
     const ResponseDiagnostics & response);
+
+  std::mutex controller_mutex_;
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr omni_arc_pub_;
 
   double max_vel_x_ {0.6};
   double min_vel_x_ {-0.6};

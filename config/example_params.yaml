@@ -1,11 +1,11 @@
-# Merge this controller-only example into a complete ROS 2 Humble Nav2 configuration.
+# Merge this controller-only example into a complete ROS 2 Jazzy Nav2 configuration.
 controller_server:
   ros__parameters:
     controller_frequency: 30.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
-    progress_checker_plugin: "progress_checker"
+    progress_checker_plugins: ["progress_checker"]
     goal_checker_plugins: ["goal_checker"]
     controller_plugins: ["FollowPath"]
     progress_checker:
@@ -43,7 +43,6 @@ controller_server:
       max_lookahead_dist: 0.33
       lookahead_time: 1.5
       use_velocity_scaled_lookahead_dist: true
-      use_interpolation: true
       transform_tolerance: 0.1
       use_regulated_linear_velocity_scaling: false  # PP curvature heuristic is not used
       use_cost_regulated_linear_velocity_scaling: true

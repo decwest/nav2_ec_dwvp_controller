@@ -38,7 +38,7 @@ Choose the value with the robot's acceleration limits and localization noise in 
 
 Fixed preview uses `lookahead_dist` with `use_velocity_scaled_lookahead_dist: false`.
 Adaptive preview uses `lookahead_time`, bounded by `min_lookahead_dist` and
-`max_lookahead_dist`. Lookahead follows the Humble Regulated Pure Pursuit circle
+`max_lookahead_dist`. Lookahead follows the Jazzy Regulated Pure Pursuit circle
 intersection. Desired yaw comes from the supplied path orientation.
 
 The translation demand is separate from the `desired_linear_vel` speed-regulation
@@ -52,7 +52,10 @@ per-axis acceleration limits over that period.
 
 `OPEN_LOOP` uses the previous command after the first cycle. A new plan, activation,
 or failed command resets this feedback, and the first command uses measured velocity.
-`CLOSED_LOOP` uses the measured twist every cycle. Configure the actual controller
+`CLOSED_LOOP` uses the measured twist every cycle. Jazzy `reset()` and cancellation
+also invalidate the previous command. Cancellation completes immediately; Nav2
+emits a stop command and downstream smoothing handles deceleration. Set
+`use_cancel_deceleration: false`; RPP cancellation deceleration is not used. Configure the actual controller
 rate and account for downstream smoothing when setting limits.
 
 The bounds apply to computed commands relative to the selected feedback.
@@ -115,3 +118,20 @@ The package is now `nav2_ec_dwvp_controller`, and the plugin type is
 `nav2_ec_dwvp_controller::ECDWVPController`. Update old build selections and YAML
 plugin strings before rebuilding. Numerical comparison configurations retain their
 recorded values, with the plugin identifier updated to the new name.
+
+## Jazzy integration
+
+A Lane Sampling Shim can load this plugin under `FollowPath.primary_controller`.
+Place every EC-DWVP parameter under that same namespace. The shim supplies the
+selected path, including pose orientations, and forwards Nav2 speed limits.
+
+Enable lateral and reverse velocities in the downstream velocity smoother as
+well as in this plugin. Match each axis's velocity and acceleration limits; do
+not bypass the collision monitor or the robot's command watchdog. With a
+velocity smoother, record both the controller command and the executed command
+when evaluating the response.
+
+The omni collision projection is published on `lookahead_collision_arc` and the
+transformed path on `received_global_plan`. Neither topic indicates which
+candidate the Lane Sampling Shim selected; use the shim's `selected_path` topic
+for that purpose.
