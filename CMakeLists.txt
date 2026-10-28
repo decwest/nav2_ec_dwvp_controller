@@ -5,10 +5,12 @@ find_package(ament_cmake REQUIRED)
 find_package(nav2_common REQUIRED)
 find_package(nav2_core REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
+find_package(nav2_msgs REQUIRED)
 find_package(nav2_util REQUIRED)
 find_package(nav2_regulated_pure_pursuit_controller REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(tf2 REQUIRED)
@@ -23,9 +25,11 @@ include_directories(include)
 
 set(dependencies
   angles
+  diagnostic_msgs
   geometry_msgs
   nav2_core
   nav2_costmap_2d
+  nav2_msgs
   nav2_regulated_pure_pursuit_controller
   nav2_util
   nav_msgs
@@ -40,6 +44,7 @@ set(library_name nav2_ec_dwvp_controller)
 
 add_library(${library_name} SHARED
   src/ec_dwvp_controller.cpp
+  src/collision_prediction.cpp
 )
 
 ament_target_dependencies(${library_name}
@@ -96,6 +101,12 @@ if(BUILD_TESTING)
   ament_add_gtest(test_controller test/test_controller.cpp)
   target_link_libraries(test_controller ${library_name})
   ament_target_dependencies(test_controller ${dependencies})
+  ament_add_gtest(test_prediction test/test_prediction.cpp)
+  target_link_libraries(test_prediction ${library_name})
+  ament_target_dependencies(test_prediction ${dependencies})
+  add_executable(prediction_replay_runner test/prediction_replay_runner.cpp)
+  target_link_libraries(prediction_replay_runner ${library_name})
+  ament_target_dependencies(prediction_replay_runner ${dependencies})
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)

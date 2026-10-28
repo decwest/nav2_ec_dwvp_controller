@@ -8,6 +8,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -77,6 +78,13 @@ public:
   {
     last_command_velocity_ = value;
     last_command_valid_ = true;
+    last_command_time_ = std::chrono::steady_clock::now();
+  }
+  void expireCommand() {last_command_time_ -= std::chrono::seconds(1);}
+  void passingLimits()
+  {
+    min_vel_theta_ = -0.5; max_vel_theta_ = 0.5; max_accel_theta_ = 0.5;
+    control_duration_ = 1.0 / 30.0;
   }
 };
 
@@ -322,22 +330,130 @@ TEST_F(ControllerTest, CostApproachAndInheritedSpeedLimits)
   EXPECT_THROW(ctrl.setSpeedLimit(-1, false), std::invalid_argument);
 }
 
-TEST_F(ControllerTest, NewPlanReseedsMeasuredFeedback)
+TEST_F(ControllerTest, PathAndGoalUpdatesPreserveOpenLoopFeedback)
 {
-  ctrl.seed(twist(0.5, 0.5, 0.5));
   ctrl.setPlan(path(2));
   EXPECT_FALSE(ctrl.commandValid());
   const auto u = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
   EXPECT_TRUE(ctrl.commandValid());
   EXPECT_FALSE(ctrl.evaluateVelocityConstraints(u, twist(0, 0, 0)));
   ctrl.setPlan(path(2));
+  EXPECT_TRUE(ctrl.commandValid());
   ctrl.clipped(true);
   const auto clipped = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
-  EXPECT_FALSE(ctrl.evaluateVelocityConstraints(clipped, twist(0, 0, 0)));
+  EXPECT_FALSE(ctrl.evaluateVelocityConstraints(clipped, u));
+  ctrl.setPlan(path(3));
+  EXPECT_TRUE(ctrl.commandValid());
+  const auto changed_goal = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
+  EXPECT_FALSE(ctrl.evaluateVelocityConstraints(changed_goal, clipped));
+  ctrl.setPlan(path(3, 1.0));
+  EXPECT_TRUE(ctrl.commandValid());
+  const auto changed_heading = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
+  EXPECT_FALSE(ctrl.evaluateVelocityConstraints(changed_heading, changed_goal));
   ctrl.deactivate();
   EXPECT_FALSE(ctrl.commandValid());
   ctrl.activate();
   EXPECT_FALSE(ctrl.commandValid());
+}
+
+TEST_F(ControllerTest, PassingReplanDoesNotReseedFromOvershootingOdometry)
+{
+  ctrl.passingLimits();
+  ctrl.setPlan(path(2));
+  const auto previous = twist(0.2, 0.0, 0.48);
+  ctrl.seed(previous);
+  auto updated = path(2);
+  updated.poses[5].pose.position.y = 0.1;
+  ctrl.setPlan(updated);
+  // passing_03 reported 0.531 rad/s at a lane change, with a 0.5 rad/s cap.
+  const auto output = ctrl.computeVelocityCommands(pose, twist(0.2, 0.0, 0.531), nullptr);
+  EXPECT_FALSE(ctrl.evaluateVelocityConstraints(output.twist, previous));
+  EXPECT_LE(std::abs(output.twist.angular.z), 0.5);
+  // CLOSED_LOOP must still reject genuinely infeasible measured feedback.
+  ctrl.feedback("CLOSED_LOOP");
+  EXPECT_THROW(
+    ctrl.computeVelocityCommands(pose, twist(0.2, 0.0, 0.531), nullptr),
+    nav2_core::NoValidControl);
+}
+
+TEST_F(ControllerTest, StopPathAndResumePreserveFeedbackWithOvershootingOdometry)
+{
+  ctrl.passingLimits();
+  ctrl.lateralTime(0.75);
+  for (const double sign : {-1.0, 1.0}) {
+    ctrl.setPlan(path(2));
+    auto previous = twist(0.2, 0.1, sign * 0.5);
+    ctrl.seed(previous);
+    // passinh_04: switching to a one-point stop path while measured angular
+    // speed was 0.638 rad/s invalidated the previous command and threw.
+    const auto measured = twist(0.2, 0.1, sign * 0.638);
+    auto stop_path = path(0);
+    stop_path.poses.resize(1);
+    for (int tick = 0; tick < 36; ++tick) {
+      ctrl.setPlan(stop_path);
+      ASSERT_TRUE(ctrl.commandValid());
+      const auto command = ctrl.computeVelocityCommands(pose, measured, nullptr).twist;
+      EXPECT_FALSE(ctrl.evaluateVelocityConstraints(command, previous));
+      EXPECT_LE(std::abs(command.linear.x), std::abs(previous.linear.x));
+      EXPECT_LE(std::abs(command.linear.y), std::abs(previous.linear.y));
+      EXPECT_LE(std::abs(command.angular.z), std::abs(previous.angular.z));
+      if (tick == 0) {
+        EXPECT_NEAR(command.angular.z, sign * (0.5 - 0.5 / 30.0), 1e-12);
+      }
+      previous = command;
+    }
+    EXPECT_DOUBLE_EQ(previous.linear.x, 0.0);
+    EXPECT_DOUBLE_EQ(previous.linear.y, 0.0);
+    EXPECT_DOUBLE_EQ(previous.angular.z, 0.0);
+    ctrl.setPlan(path(3, sign * 0.7));
+    const auto resumed = ctrl.computeVelocityCommands(pose, measured, nullptr).twist;
+    EXPECT_FALSE(ctrl.evaluateVelocityConstraints(resumed, previous));
+    EXPECT_GT(resumed.linear.x, 0.0);
+  }
+}
+
+TEST_F(ControllerTest, SameGoalAfterCommandGapReseedsMeasuredFeedback)
+{
+  ctrl.setPlan(path(2));
+  ctrl.seed(twist(0.5, 0.5, 0.5));
+  ctrl.expireCommand();
+  ctrl.setPlan(path(2));
+  const auto output = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr);
+  EXPECT_FALSE(ctrl.evaluateVelocityConstraints(output.twist, twist(0, 0, 0)));
+}
+
+TEST_F(ControllerTest, CollisionPublishesExactCostmapAndRejectedCommand)
+{
+  auto subscriber = std::make_shared<rclcpp::Node>("collision_snapshot_test");
+  nav2_msgs::msg::Costmap::SharedPtr snapshot;
+  geometry_msgs::msg::TwistStamped::SharedPtr rejected;
+  auto map_sub = subscriber->create_subscription<nav2_msgs::msg::Costmap>(
+    "FollowPath/collision_costmap", 10,
+    [&snapshot](nav2_msgs::msg::Costmap::SharedPtr msg) {snapshot = msg;});
+  auto cmd_sub = subscriber->create_subscription<geometry_msgs::msg::TwistStamped>(
+    "FollowPath/collision_command", 10,
+    [&rejected](geometry_msgs::msg::TwistStamped::SharedPtr msg) {rejected = msg;});
+  unsigned int mx, my;
+  const auto corner = map->getRobotFootprint().front();
+  ASSERT_TRUE(map->getCostmap()->worldToMap(corner.x, corner.y, mx, my));
+  map->getCostmap()->setCost(mx, my, nav2_costmap_2d::LETHAL_OBSTACLE);
+  pose.header.stamp = node->now();
+  const auto command = twist(0.1, -0.1, 0.2);
+  for (int i = 0; i < 200 && (!snapshot || !rejected); ++i) {
+    ASSERT_TRUE(ctrl.isCollisionImminentOmni(pose, command, 1.0));
+    rclcpp::spin_some(subscriber);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(snapshot);
+  ASSERT_TRUE(rejected);
+  map->getCostmap()->setCost(mx, my, nav2_costmap_2d::FREE_SPACE);
+  EXPECT_EQ(snapshot->header.stamp, pose.header.stamp);
+  EXPECT_EQ(snapshot->header.frame_id, "base_link");
+  EXPECT_EQ(snapshot->metadata.size_x, 200u);
+  EXPECT_EQ(snapshot->data[my * 200 + mx], nav2_costmap_2d::LETHAL_OBSTACLE);
+  EXPECT_EQ(rejected->header.stamp, pose.header.stamp);
+  EXPECT_DOUBLE_EQ(rejected->twist.linear.y, -0.1);
+  EXPECT_DOUBLE_EQ(rejected->twist.angular.z, 0.2);
 }
 
 TEST_F(ControllerTest, FailedCommandInvalidatesFeedback)
@@ -368,6 +484,7 @@ TEST_F(ControllerTest, GoalOnlyRotationCommandsAndFiniteOutput)
 TEST_F(ControllerTest, AntipodalFinalGoalUsesNegativeTurn)
 {
   for (const double yaw : {M_PI, -M_PI}) {
+    ctrl.reset();  // Independent trials from rest, not consecutive replans.
     ctrl.setPlan(path(0, yaw));
     const auto u = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
     EXPECT_LT(u.angular.z, 0.0);
@@ -521,6 +638,7 @@ TEST_F(ControllerTest, ScaledVpSharesClippedTerminalHandling)
   ctrl.clipped(true);
   ctrl.setPlan(path(0.001, 0.9));
   const auto clip = ctrl.computeVelocityCommands(pose, twist(0.1, -0.1, 0.2), nullptr).twist;
+  ctrl.reset();
   ctrl.scaled(true);
   ctrl.setPlan(path(0.001, 0.9));
   const auto scaled = ctrl.computeVelocityCommands(pose, twist(0.1, -0.1, 0.2), nullptr).twist;
@@ -712,18 +830,22 @@ TEST_F(ControllerTest, CompensationRetainsIncomingSegmentAcrossPruning)
 TEST_F(ControllerTest, DisabledCommandsAndCompensatedTerminalCommandsAreIdentical)
 {
   for (int mode = 0; mode < 3; ++mode) {
+    ctrl.reset();
     ctrl.clipped(mode != 0);
     ctrl.scaled(mode == 2);
     ctrl.lateralTime(0.0);
     ctrl.setPlan(path(2.0, 0.7));
     const auto baseline = ctrl.computeVelocityCommands(pose, twist(0.1, -0.1, 0.2), nullptr).twist;
+    ctrl.reset();
     ctrl.lateralTime(-0.75);
     ctrl.setPlan(path(2.0, 0.7));
     const auto disabled = ctrl.computeVelocityCommands(pose, twist(0.1, -0.1, 0.2), nullptr).twist;
     EXPECT_EQ(baseline, disabled);
+    ctrl.reset();
     ctrl.lateralTime(0.0);
     ctrl.setPlan(path(0.001, 0.9));
     const auto terminal = ctrl.computeVelocityCommands(pose, twist(0.1, -0.1, 0.2), nullptr).twist;
+    ctrl.reset();
     ctrl.lateralTime(0.75);
     ctrl.setPlan(path(0.001, 0.9));
     const auto compensated =
@@ -806,6 +928,7 @@ TEST_F(ControllerTest, LateralAndReversePathsPreserveRequestedHeading)
   EXPECT_GT(command.linear.y, 0.0);
   EXPECT_NEAR(command.linear.x, 0.0, 1e-12);
   EXPECT_NEAR(command.angular.z, 0.0, 1e-12);
+  ctrl.reset();  // Independent reverse trial from rest.
   ctrl.setPlan(path(-2));
   command = ctrl.computeVelocityCommands(pose, twist(0, 0, 0), nullptr).twist;
   EXPECT_LT(command.linear.x, 0.0);

@@ -148,6 +148,27 @@ void ECDWVPController::configure(
   node->get_parameter(
     name + ".use_collision_detection_for_omni",
     use_collision_detection_for_omni_);
+  declare_parameter_if_not_declared(
+    node.get(), name + ".collision_prediction_mode", rclcpp::ParameterValue("constant_velocity"));
+  declare_parameter_if_not_declared(
+    node.get(), name + ".collision_prediction_time_buffer", rclcpp::ParameterValue(2.0));
+  declare_parameter_if_not_declared(
+    node.get(), name + ".collision_stop_margin", rclcpp::ParameterValue(0.3));
+  declare_parameter_if_not_declared(
+    node.get(), name + ".collision_prediction_max_steps", rclcpp::ParameterValue(300));
+  node->get_parameter(name + ".collision_prediction_mode", collision_prediction_mode_);
+  node->get_parameter(name + ".collision_prediction_time_buffer",
+      collision_prediction_time_buffer_);
+  node->get_parameter(name + ".collision_stop_margin", collision_stop_margin_);
+  node->get_parameter(name + ".collision_prediction_max_steps", collision_prediction_max_steps_);
+  if ((collision_prediction_mode_ != "constant_velocity" &&
+    collision_prediction_mode_ != "closed_loop") ||
+    !std::isfinite(collision_prediction_time_buffer_) || collision_prediction_time_buffer_ < 0.0 ||
+    !std::isfinite(collision_stop_margin_) || collision_stop_margin_ < 0.0 ||
+    collision_prediction_max_steps_ < 1)
+  {
+    throw std::invalid_argument("Invalid collision prediction mode, buffer, margin or step limit");
+  }
   node->get_parameter(name + ".enable_csv_logging", enable_csv_logging_);
   node->get_parameter(name + ".csv_log_directory", csv_log_directory_);
   node->get_parameter(name + ".csv_filename_prefix", csv_filename_prefix_);
@@ -191,6 +212,16 @@ void ECDWVPController::configure(
   // Jazzy's RPP collision checker owns its arc publisher. EC-DWVP projects
   // vx/vy/omega itself and therefore needs its own lifecycle publisher.
   omni_arc_pub_ = node->create_publisher<nav_msgs::msg::Path>("lookahead_collision_arc", 1);
+  auto diagnostic_namespace = name;
+  std::replace(diagnostic_namespace.begin(), diagnostic_namespace.end(), '.', '/');
+  nominal_arc_pub_ = node->create_publisher<nav_msgs::msg::Path>(
+    diagnostic_namespace + "/nominal_collision_arc", 1);
+  prediction_diagnostics_pub_ = node->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+    diagnostic_namespace + "/collision_prediction", rclcpp::QoS(10));
+  collision_costmap_pub_ = node->create_publisher<nav2_msgs::msg::Costmap>(
+    diagnostic_namespace + "/collision_costmap", rclcpp::QoS(10));
+  collision_command_pub_ = node->create_publisher<geometry_msgs::msg::TwistStamped>(
+    diagnostic_namespace + "/collision_command", rclcpp::QoS(10));
 
   if (enable_csv_logging_) {
     if (csv_log_directory_.empty()) {
@@ -229,12 +260,20 @@ void ECDWVPController::activate()
   last_command_valid_ = false;
   rpp::RegulatedPurePursuitController::activate();
   omni_arc_pub_->on_activate();
+  nominal_arc_pub_->on_activate();
+  prediction_diagnostics_pub_->on_activate();
+  collision_costmap_pub_->on_activate();
+  collision_command_pub_->on_activate();
 }
 
 void ECDWVPController::deactivate()
 {
   last_command_valid_ = false;
   omni_arc_pub_->on_deactivate();
+  nominal_arc_pub_->on_deactivate();
+  prediction_diagnostics_pub_->on_deactivate();
+  collision_costmap_pub_->on_deactivate();
+  collision_command_pub_->on_deactivate();
   rpp::RegulatedPurePursuitController::deactivate();
   closeCsvLogFile();
 }
@@ -244,6 +283,10 @@ void ECDWVPController::cleanup()
   last_command_valid_ = false;
   reference_plan_ = nav_msgs::msg::Path();
   omni_arc_pub_.reset();
+  nominal_arc_pub_.reset();
+  prediction_diagnostics_pub_.reset();
+  collision_costmap_pub_.reset();
+  collision_command_pub_.reset();
   rpp::RegulatedPurePursuitController::cleanup();
   closeCsvLogFile();
 }
@@ -259,8 +302,9 @@ void ECDWVPController::setPlan(const nav_msgs::msg::Path & path)
   if (lateral_time_constant_ > 0.0) {
     reference_plan_ = path;
   }
-  // New plans may follow a stopped/cancelled goal. Seed from measured speed once.
-  last_command_valid_ = false;
+  // A new path or endpoint changes the target, not the velocity feedback.
+  // Preserve the last command through lane changes, temporary stop paths and
+  // goal updates. Lifecycle resets, failures and command gaps still invalidate it.
   if (!enable_csv_logging_) {
     return;
   }
@@ -785,7 +829,41 @@ bool ECDWVPController::isCollisionImminentOmni(
     }
   }
   omni_arc_pub_->publish(projected_path);
+  if (collision) {
+    publishCollisionSnapshot(pose, command);
+  }
   return collision;
+}
+
+void ECDWVPController::publishCollisionSnapshot(
+  const geometry_msgs::msg::PoseStamped & pose, const geometry_msgs::msg::Twist & command)
+{
+  // Called with the costmap mutex held by computeVelocityCommands. These are
+  // the exact cells consulted above, not the next periodic costmap publication.
+  if (collision_costmap_pub_->get_subscription_count() > 0) {
+    nav2_msgs::msg::Costmap snapshot;
+    snapshot.header = pose.header;
+    snapshot.header.frame_id = costmap_ros_->getGlobalFrameID();
+    // The layer's last update time is unavailable here; leave metadata.update_time
+    // unset. The header identifies the control pose, shared with the collision arc.
+    snapshot.metadata.layer = "ec_dwvp_collision_snapshot";
+    snapshot.metadata.resolution = costmap_->getResolution();
+    snapshot.metadata.size_x = costmap_->getSizeInCellsX();
+    snapshot.metadata.size_y = costmap_->getSizeInCellsY();
+    snapshot.metadata.origin.position.x = costmap_->getOriginX();
+    snapshot.metadata.origin.position.y = costmap_->getOriginY();
+    snapshot.metadata.origin.orientation.w = 1.0;
+    const auto count = static_cast<size_t>(snapshot.metadata.size_x) * snapshot.metadata.size_y;
+    snapshot.data.assign(costmap_->getCharMap(), costmap_->getCharMap() + count);
+    collision_costmap_pub_->publish(snapshot);
+  }
+  if (collision_command_pub_->get_subscription_count() > 0) {
+    geometry_msgs::msg::TwistStamped attempted;
+    attempted.header = pose.header;
+    attempted.header.frame_id = costmap_ros_->getBaseFrameID();
+    attempted.twist = command;
+    collision_command_pub_->publish(attempted);
+  }
 }
 
 geometry_msgs::msg::Twist ECDWVPController::computeScaledVelocity(
@@ -1064,6 +1142,62 @@ bool ECDWVPController::evaluateVelocityConstraints(
   return x_violation || y_violation || w_violation;
 }
 
+ECDWVPController::ControlStep ECDWVPController::computeControlStep(
+  const nav_msgs::msg::Path & transformed_plan,
+  const geometry_msgs::msg::PoseStamped & final_goal,
+  const ReferenceProjection & reference, const geometry_msgs::msg::Twist & feedback_speed,
+  double pose_cost, double yaw_tolerance)
+{
+  const double lookahead_dist = getLookAheadDistanceOmni(feedback_speed);
+  const auto preview = computePreviewTarget(transformed_plan, lookahead_dist);
+  const auto & carrot_pose = preview.pose;
+  const double carrot_dist2 =
+    (carrot_pose.pose.position.x * carrot_pose.pose.position.x) +
+    (carrot_pose.pose.position.y * carrot_pose.pose.position.y);
+  const double curvature = (carrot_dist2 > 1e-9) ?
+    (2.0 * carrot_pose.pose.position.y / carrot_dist2) : 0.0;
+
+  const double lookahead_yaw = preview.yaw;
+  bool goal_region = false;
+  bool nearest_target = false;
+  if (lateral_time_constant_ > 0.0) {
+    const auto & end = transformed_plan.poses.back().pose.position;
+    goal_region = preview.goal_region &&
+      std::hypot(end.x - final_goal.pose.position.x, end.y - final_goal.pose.position.y) < 1e-9;
+    nearest_target = preview.nearest_target;
+  }
+  ResponseDiagnostics response;
+  const geometry_msgs::msg::Twist desired_velocity = computeDesiredVelocity(
+    carrot_pose, lookahead_yaw, &reference, goal_region, nearest_target, &response);
+  const double regulated_speed = computeRegulatedSpeed(
+    transformed_plan, feedback_speed,
+    pose_cost);
+  const DynamicWindowBounds3D dynamic_window = computeDynamicWindow(feedback_speed);
+
+  const auto regulated_window = applyRegulationToDynamicWindow(dynamic_window, regulated_speed);
+  const double final_distance = std::hypot(
+    final_goal.pose.position.x, final_goal.pose.position.y);
+  const double final_yaw = tf2::getYaw(final_goal.pose.orientation);
+  geometry_msgs::msg::Twist cmd_twist;
+  const bool terminal = final_distance <= goal_dist_tol_ || maximumTranslationalSpeed() < 1e-12;
+  if (terminal) {
+    cmd_twist = computeGoalVelocity(final_yaw, yaw_tolerance, regulated_window);
+    response = ResponseDiagnostics();
+  } else if (use_dynamic_window_vector_pursuit_) {
+    cmd_twist = computeOptimalVelocityWithinDynamicWindow(
+      desired_velocity, regulated_window, true);
+  } else if (use_uniform_velocity_scaling_) {
+    cmd_twist = computeScaledVelocity(desired_velocity, regulated_speed, regulated_window);
+  } else {
+    // Explicit clipped VP ablation: the same reference and feasible limits, without ray search.
+    cmd_twist = clipVelocityToBounds(desired_velocity, regulated_window);
+  }
+
+  return {cmd_twist, dynamic_window, regulated_window, preview, response, lookahead_dist,
+    regulated_speed, curvature, terminal,
+    final_distance <= goal_dist_tol_ && std::abs(wrapOrientationError(final_yaw)) <= yaw_tolerance};
+}
+
 geometry_msgs::msg::TwistStamped ECDWVPController::computeVelocityCommands(
   const geometry_msgs::msg::PoseStamped & pose,
   const geometry_msgs::msg::Twist & speed,
@@ -1072,6 +1206,13 @@ geometry_msgs::msg::TwistStamped ECDWVPController::computeVelocityCommands(
   std::lock_guard<std::mutex> lock_reinit(controller_mutex_);
   std::lock_guard<std::mutex> lock_params(param_handler_->getMutex());
 
+  const auto command_time = std::chrono::steady_clock::now();
+  if (last_command_valid_ &&
+    std::chrono::duration<double>(command_time - last_command_time_).count() >
+    std::max(0.1, 3.0 * control_duration_))
+  {
+    last_command_valid_ = false;
+  }
   const geometry_msgs::msg::Twist feedback_speed =
     (velocity_feedback_ == "CLOSED_LOOP" || !last_command_valid_) ? speed : last_command_velocity_;
   // A failed command may cause Nav2 to stop; never reuse the pre-failure command.
@@ -1122,57 +1263,21 @@ geometry_msgs::msg::TwistStamped ECDWVPController::computeVelocityCommands(
   }
 
 
-  const double lookahead_dist = getLookAheadDistanceOmni(feedback_speed);
-  const auto preview = computePreviewTarget(transformed_plan, lookahead_dist);
-  const auto & carrot_pose = preview.pose;
-  carrot_pub_->publish(createCarrotMsg(carrot_pose));
-  const double carrot_dist2 =
-    (carrot_pose.pose.position.x * carrot_pose.pose.position.x) +
-    (carrot_pose.pose.position.y * carrot_pose.pose.position.y);
-  const double curvature = (carrot_dist2 > 1e-9) ?
-    (2.0 * carrot_pose.pose.position.y / carrot_dist2) : 0.0;
-
-  const double lookahead_yaw = preview.yaw;
-  bool goal_region = false;
-  bool nearest_target = false;
-  if (lateral_time_constant_ > 0.0) {
-    const auto & end = transformed_plan.poses.back().pose.position;
-    goal_region = preview.goal_region &&
-      std::hypot(end.x - final_goal.pose.position.x, end.y - final_goal.pose.position.y) < 1e-9;
-    nearest_target = preview.nearest_target;
-  }
-  ResponseDiagnostics response;
-  const geometry_msgs::msg::Twist desired_velocity = computeDesiredVelocity(
-    carrot_pose, lookahead_yaw, &reference, goal_region, nearest_target, &response);
-  const double regulated_speed = computeRegulatedSpeed(
-    transformed_plan, feedback_speed,
-      collision_checker_->costAtPose(pose.pose.position.x, pose.pose.position.y));
-  const DynamicWindowBounds3D dynamic_window = computeDynamicWindow(feedback_speed);
-
-  const auto regulated_window = applyRegulationToDynamicWindow(dynamic_window, regulated_speed);
-  const double final_distance = std::hypot(
-    final_goal.pose.position.x, final_goal.pose.position.y);
-  const double final_yaw = tf2::getYaw(final_goal.pose.orientation);
   const double yaw_tolerance =
     goal_checker ? std::abs(tf2::getYaw(pose_tolerance.orientation)) : 0.0;
-  geometry_msgs::msg::Twist cmd_twist;
-  if (final_distance <= goal_dist_tol_ || maximumTranslationalSpeed() < 1e-12) {
-    cmd_twist = computeGoalVelocity(final_yaw, yaw_tolerance, regulated_window);
-    response = ResponseDiagnostics();
-  } else if (use_dynamic_window_vector_pursuit_) {
-    cmd_twist = computeOptimalVelocityWithinDynamicWindow(
-      desired_velocity, regulated_window, true);
-  } else if (use_uniform_velocity_scaling_) {
-    cmd_twist = computeScaledVelocity(desired_velocity, regulated_speed, regulated_window);
-  } else {
-    // Explicit clipped VP ablation: the same reference and feasible limits, without ray search.
-    cmd_twist = clipVelocityToBounds(desired_velocity, regulated_window);
-  }
+  const auto step = computeControlStep(
+    transformed_plan, final_goal, reference, feedback_speed,
+    collision_checker_->costAtPose(pose.pose.position.x, pose.pose.position.y), yaw_tolerance);
+  const auto & carrot_pose = step.preview.pose;
+  carrot_pub_->publish(createCarrotMsg(carrot_pose));
+  auto cmd_twist = step.command;
 
   if (params_->use_collision_detection && use_collision_detection_for_omni_) {
     const double carrot_dist = std::hypot(carrot_pose.pose.position.x, carrot_pose.pose.position.y);
-    if (isCollisionImminentOmni(pose, cmd_twist, carrot_dist)) {
-      last_command_valid_ = false;
+    if (collision_prediction_mode_ == "closed_loop") {
+      cmd_twist = limitPredictedCollision(
+        makePredictionContext(pose, feedback_speed, speed, yaw_tolerance), step);
+    } else if (isCollisionImminentOmni(pose, cmd_twist, carrot_dist)) {
       throw nav2_core::NoValidControl("ECDWVPController detected collision ahead");
     }
   }
@@ -1199,15 +1304,16 @@ geometry_msgs::msg::TwistStamped ECDWVPController::computeVelocityCommands(
     speed,
     feedback_speed,
     cmd_vel.twist,
-    dynamic_window,
-    curvature,
-    regulated_speed,
-    lookahead_dist,
-    lookahead_yaw,
+    step.window,
+    step.curvature,
+    step.regulated_speed,
+    step.lookahead,
+    step.preview.yaw,
     constraints_violation,
-    response);
+    step.response);
 
   last_command_velocity_ = cmd_vel.twist;
+  last_command_time_ = command_time;
   last_command_valid_ = true;
   return cmd_vel;
 }

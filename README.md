@@ -55,6 +55,35 @@ path tangent, allowing sideways travel.
 The [configuration reference](docs/configuration.md) explains defaults, feedback,
 speed regulation, comparison modes, and logging. This branch targets Jazzy; `main` retains the Humble implementation.
 
+With `OPEN_LOOP`, path updates preserve the previous successful command, including
+changed endpoints, one-point stop paths and new goals during continuous control.
+Activation, reset/cancel, failed commands, invalid empty paths, or a command gap longer than
+`max(0.1 s, 3 / controller_frequency)` reseeds from measured velocity. Measured
+feedback outside the acceleration-feasible velocity limits still raises an error;
+replanning does not relax the velocity or acceleration constraints.
+
+Closed-loop collision prediction can be enabled with
+`collision_prediction_mode: closed_loop`. It repeatedly runs EC-DWVP using virtual
+poses and velocities, including moving preview targets and acceleration limits.
+It maintains the candidate command while enough stopping distance remains, then
+limits speed and verifies the resulting trajectory. The default horizon is maximum
+stopping time plus 2 s, with 0.3 m additional stopping travel. See the
+[prediction model and diagnostics](docs/configuration.md#closed-loop-prediction-and-braking)
+for assumptions and parameters. Omitting the mode preserves constant-command checking.
+
+When collision prediction reduces or rejects a command, the plugin also publishes
+`<controller namespace>/collision_costmap` (`nav2_msgs/Costmap`) and
+`<controller namespace>/collision_command` (`geometry_msgs/TwistStamped`) if subscribed.
+Dots in the plugin namespace become slashes, e.g. `FollowPath.primary_controller` becomes
+`/FollowPath/primary_controller/collision_costmap`. The costmap is copied under the control
+cycle's costmap lock, so it contains the exact cells checked by the controller.
+The command is the original body-frame candidate, not an actuator command.
+Both share the control pose stamp with `/lookahead_collision_arc`. Costmap
+`metadata.update_time` is unset because the layer update timestamp is unavailable.
+These intervention snapshots allow analysis of transient obstacles that periodic
+costmap publications can miss. Castella's `bagrec nav` profile includes them via
+its `/FollowPath/.*` subscription.
+
 ## Experiment configurations
 
 The previously released experiment settings are in [config/paper/](config/paper/).

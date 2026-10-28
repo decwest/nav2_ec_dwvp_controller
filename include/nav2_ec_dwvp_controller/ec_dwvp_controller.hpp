@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -20,7 +21,9 @@
 
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
+#include "diagnostic_msgs/msg/diagnostic_array.hpp"
 #include "nav_msgs/msg/path.hpp"
+#include "nav2_msgs/msg/costmap.hpp"
 #include "nav2_regulated_pure_pursuit_controller/regulated_pure_pursuit_controller.hpp"
 
 namespace nav2_ec_dwvp_controller
@@ -92,6 +95,75 @@ protected:
     double max_w;
   };
 
+  struct ControlStep
+  {
+    geometry_msgs::msg::Twist command;
+    DynamicWindowBounds3D window;
+    DynamicWindowBounds3D regulated_window;
+    PreviewTarget preview;
+    ResponseDiagnostics response;
+    double lookahead;
+    double regulated_speed;
+    double curvature;
+    bool terminal;
+    bool at_goal;
+  };
+
+  struct PredictionContext
+  {
+    nav_msgs::msg::Path plan;
+    nav_msgs::msg::Path reference;
+    geometry_msgs::msg::PoseStamped start;
+    double yaw_tolerance;
+    double radius;
+    double horizon;
+  };
+
+  struct PredictionResult
+  {
+    nav_msgs::msg::Path path;
+    // Control-boundary poses and commands, also used by the independent rollout tests.
+    std::vector<geometry_msgs::msg::PoseStamped> control_poses;
+    std::vector<geometry_msgs::msg::Twist> commands;
+    geometry_msgs::msg::Twist first_command;
+    double first_scale {1.0};
+    double distance {0.0};
+    double event_distance {std::numeric_limits<double>::infinity()};
+    size_t steps {0};
+    std::string event {"clear"};
+  };
+
+  ControlStep computeControlStep(
+    const nav_msgs::msg::Path & local_plan,
+    const geometry_msgs::msg::PoseStamped & local_goal,
+    const ReferenceProjection & reference, const geometry_msgs::msg::Twist & feedback,
+    double pose_cost, double yaw_tolerance);
+  PredictionContext makePredictionContext(
+    const geometry_msgs::msg::PoseStamped & pose,
+    const geometry_msgs::msg::Twist & feedback,
+    const geometry_msgs::msg::Twist & measured, double yaw_tolerance);
+  nav_msgs::msg::Path predictionLocalPlan(
+    const nav_msgs::msg::Path & plan, const geometry_msgs::msg::PoseStamped & pose,
+    size_t & begin) const;
+  PredictionResult predictTracking(
+    const PredictionContext & context, const ControlStep & first,
+    double stop_budget = std::numeric_limits<double>::infinity());
+  geometry_msgs::msg::Twist limitPredictedCollision(
+    const PredictionContext & context, const ControlStep & first);
+  double stoppingTime(const geometry_msgs::msg::Twist & command) const;
+  static double sweptSpeed(const geometry_msgs::msg::Twist & command, double radius);
+  double stoppingDistance(const geometry_msgs::msg::Twist & command, double radius) const;
+  double brakingScale(
+    const geometry_msgs::msg::Twist & command, double radius, double available) const;
+  double predictionHorizon(
+    const geometry_msgs::msg::Twist & feedback,
+    const geometry_msgs::msg::Twist & measured) const;
+  std::string predictionPoseStatus(const geometry_msgs::msg::PoseStamped & pose);
+  void publishPredictionDiagnostics(
+    const PredictionContext & context, const ControlStep & first,
+    const PredictionResult & nominal, const PredictionResult & checked,
+    const std::string & status, double elapsed_ms);
+
   double getLookAheadDistanceOmni(const geometry_msgs::msg::Twist & speed) const;
   PreviewTarget computePreviewTarget(const nav_msgs::msg::Path & plan, double distance);
   double computeLookAheadYaw(
@@ -121,6 +193,8 @@ protected:
   bool isCollisionImminentOmni(
     const geometry_msgs::msg::PoseStamped & pose,
     const geometry_msgs::msg::Twist & command, double carrot_distance);
+  void publishCollisionSnapshot(
+    const geometry_msgs::msg::PoseStamped & pose, const geometry_msgs::msg::Twist & command);
 
   geometry_msgs::msg::Twist computeScaledVelocity(
     const geometry_msgs::msg::Twist & desired, double regulated_speed,
@@ -170,6 +244,12 @@ protected:
 
   std::mutex controller_mutex_;
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr omni_arc_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr nominal_arc_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr
+    prediction_diagnostics_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<nav2_msgs::msg::Costmap>::SharedPtr collision_costmap_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::TwistStamped>::SharedPtr
+    collision_command_pub_;
 
   double max_vel_x_ {0.6};
   double min_vel_x_ {-0.6};
@@ -188,6 +268,10 @@ protected:
   bool use_dynamic_window_vector_pursuit_ {true};
   bool use_uniform_velocity_scaling_ {false};
   bool use_collision_detection_for_omni_ {true};
+  std::string collision_prediction_mode_ {"constant_velocity"};
+  double collision_prediction_time_buffer_ {2.0};
+  double collision_stop_margin_ {0.3};
+  int collision_prediction_max_steps_ {300};
   bool enable_csv_logging_ {false};
   std::string csv_log_directory_ {"/tmp"};
   std::string csv_filename_prefix_ {"dwvp_log"};
@@ -196,6 +280,7 @@ protected:
   std::ofstream csv_stream_;
   geometry_msgs::msg::Twist last_command_velocity_;
   bool last_command_valid_ {false};
+  std::chrono::steady_clock::time_point last_command_time_;
   // RPP prunes its own plan to the nearest vertex. Projection needs the full polyline.
   nav_msgs::msg::Path reference_plan_;
 };

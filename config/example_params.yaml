@@ -54,6 +54,10 @@ controller_server:
       min_approach_linear_velocity: 0.05
       use_collision_detection: true
       use_collision_detection_for_omni: true
+      collision_prediction_mode: "closed_loop"
+      collision_prediction_time_buffer: 2.0
+      collision_stop_margin: 0.3
+      collision_prediction_max_steps: 300
       max_allowed_time_to_collision_up_to_carrot: 1.0
       enable_csv_logging: false
       csv_log_directory: "/tmp"

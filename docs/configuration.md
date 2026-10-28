@@ -21,6 +21,10 @@ The values below are the plugin defaults when a setting is omitted.
 | `use_dynamic_window_vector_pursuit` | `true` | Select commands using the desired-velocity ray and dynamic window. |
 | `use_uniform_velocity_scaling` | `false` | Enable the Scaled VP comparison when dynamic-window selection is disabled. |
 | `use_collision_detection_for_omni` | `true` | Project the full holonomic motion when inherited collision checking is enabled. |
+| `collision_prediction_mode` | `constant_velocity` | Legacy command extrapolation, or `closed_loop` tracking prediction with a stopping-distance governor. |
+| `collision_prediction_time_buffer` | `2.0` | Extra prediction time [s] after the maximum configured or observed stopping time; closed-loop mode only. |
+| `collision_stop_margin` | `0.3` | Extra swept travel [m] to reserve before predicted contact or the costmap boundary; closed-loop mode only. |
+| `collision_prediction_max_steps` | `300` | Maximum control updates per rollout. Insufficient coverage rejects the command rather than silently shortening prediction. |
 | `enable_csv_logging` | `false` | Record controller diagnostics. |
 | `csv_log_directory` | `/tmp` | Writable log directory. |
 | `csv_filename_prefix` | `dwvp_log` | Log filename prefix. |
@@ -50,8 +54,14 @@ uses the speed supported in all positive and negative x/y directions.
 The control period is `1 / controller_frequency`. The dynamic window applies the
 per-axis acceleration limits over that period.
 
-`OPEN_LOOP` uses the previous command after the first cycle. A new plan, activation,
-or failed command resets this feedback, and the first command uses measured velocity.
+`OPEN_LOOP` uses the previous successful command after the first cycle. All valid
+path updates preserve this feedback, including changed goal positions/headings
+and temporary one-point stop paths. The new target is evaluated using the dynamic
+window around that command, so a stop path decelerates and a replacement goal
+changes the command within the acceleration limits.
+Activation, failed commands, invalid empty paths, or a command gap exceeding
+`max(0.1 s, 3 / controller_frequency)` resets this feedback; the next command uses
+measured velocity.
 `CLOSED_LOOP` uses the measured twist every cycle. Jazzy `reset()` and cancellation
 also invalidate the previous command. Cancellation completes immediately; Nav2
 emits a stop command and downstream smoothing handles deceleration. Set
@@ -101,9 +111,88 @@ and then clips to the acceleration window. All modes share terminal handling.
 ## Collision checking and logs
 
 Enable both `use_collision_detection` and `use_collision_detection_for_omni` for
-footprint projection that includes sideways motion and rotation. The projection
-horizon uses `max_allowed_time_to_collision_up_to_carrot`. This check evaluates
-the current commanded motion and does not plan an obstacle-avoidance path.
+footprint projection that includes sideways motion and rotation.
+
+`constant_velocity` retains the previous behavior: hold the candidate command,
+project for `max_allowed_time_to_collision_up_to_carrot` (also capped at the
+initial carrot), and reject on collision. Existing configurations keep this mode
+unless explicitly changed. The example and Castella lane configuration select
+`closed_loop`.
+
+### Closed-loop prediction and braking
+
+At every simulated control period, recompute the same EC-DWVP control step used
+for the real command: preview, reference projection, lateral compensation,
+cost/approach regulation, dynamic window, velocity selection and terminal control.
+The preview moves along the path; it does not terminate prediction. TF, reference
+path, costmap and tolerances are fixed at the real control cycle. Prediction has
+its own pruning cursor and never updates real feedback, GoalChecker or plan state.
+
+The horizon is `max(max_axis_speed / axis_acceleration, observed_stop_time) +
+collision_prediction_time_buffer`, with at least one control period. Both selected
+feedback and measured velocity contribute to the horizon. With limits of 0.5 on
+all axes and a 2 s buffer, this is 3 s (90 updates at 30 Hz). The legacy
+`max_allowed_time_to_collision_up_to_carrot` is unused in this mode.
+
+The governor measures swept travel as `integral(hypot(vx, vy) + R * abs(omega)) dt`,
+where R is the footprint's circumscribed radius. Absolute angular travel avoids
+cancellation when rotation reverses. The stopping model scales all three velocity
+components to zero together in `T = max(abs(component) / axis_acceleration)`.
+Required travel is `swept_speed * (control_period + T / 2)`, including one command
+period. For straight motion this reduces to `v * dt + v^2 / (2a)`.
+
+If the first contact is farther away than required stopping travel plus the
+margin, the first command is unchanged by this governor. Otherwise solve the
+quadratic stopping bound for the largest common velocity scale, then enforce the
+reachable regulated window. The default 0.3 m margin is additional **travel along
+the predicted motion**, not a guaranteed 0.3 m Euclidean clearance on every side.
+Pure rotation uses outside-footprint travel in the same units.
+
+A second rollout verifies the governed commands and updates their remaining stop
+budget after every step. If window clipping prevents sufficient braking, the
+modified trajectory collides, TF/path calculation fails, or the required horizon
+exceeds the step limit, report `NoValidControl`. Ordinary governed slowing/stopping
+returns a normal reachable command, not an exception. The costmap boundary is a
+stopping boundary; a partially uncovered footprint is not assumed clear. Unknown
+cell and lethal-cost handling otherwise retain the inherited collision checker.
+
+Each command is held for one period and integrated with holonomic motion.
+Collision samples are added only when swept motion exceeds half a grid cell;
+they do not recompute the controller. First contact is refined with eight bisection
+checks to prevent sampling jitter in the stopping target. There are at most two
+rollouts. Remaining stop budgets within `resolution / 512` are rounded toward an
+earlier stop, still subject to acceleration limits, to avoid microscopic restart
+commands from contact-refinement noise. A stationary terminal or governed stop
+can finish early.
+
+This predicts ideal command following. It does not model downstream smoother
+timing, actuator lag, future pedestrian motion, or future lane replanning. The
+cost/goal speed regulation and the downstream Collision Monitor remain active.
+The method does not search for a different obstacle-avoidance path.
+
+### Diagnostics
+
+`lookahead_collision_arc` is the final checked trajectory; an unsuccessful
+verification publishes its checked prefix, not a claim of safety. The controller
+namespace also contains:
+
+* `nominal_collision_arc` (`nav_msgs/Path`): ungoverned tracking prediction.
+* `collision_prediction` (`diagnostic_msgs/DiagnosticArray`): status (`clear`,
+  `obstacle_ahead`, `limited`, or a rejection reason), nominal event, collision
+  travel, candidate/selected stopping travel, stop margin, requested velocity
+  scale, horizon, rollout update counts and prediction processing time in ms.
+* `collision_costmap` and `collision_command`: the exact frozen grid and nominal
+  command when reduced or rejected, published only when subscribed. These are
+  diagnostic inputs, not actuator commands. The command can be reduced rather
+  than rejected in closed-loop mode.
+
+Headers share the real control pose time. Predicted poses do not request future
+TF transforms. An infinite collision distance means no contact was found inside
+the checked horizon. `speed_scale` is the requested common scale before window
+clipping; the selected stopping distance reports the reachable result.
+`compute_time_ms` measures prediction/governing, excluding the initial real control
+step and TF snapshot. Use end-to-end controller timing for deadline checks.
+Castella's existing `bagrec nav` profile records these namespace topics.
 
 CSV diagnostics include the desired and selected velocities, physical and regulated
 windows, and lateral-response geometry. `*_nav` columns are computed estimates,
