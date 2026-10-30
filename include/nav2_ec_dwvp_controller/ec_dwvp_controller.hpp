@@ -137,7 +137,8 @@ protected:
     const nav_msgs::msg::Path & local_plan,
     const geometry_msgs::msg::PoseStamped & local_goal,
     const ReferenceProjection & reference, const geometry_msgs::msg::Twist & feedback,
-    double pose_cost, double yaw_tolerance);
+    double pose_cost, double yaw_tolerance,
+    const geometry_msgs::msg::PoseStamped & robot_pose);
   PredictionContext makePredictionContext(
     const geometry_msgs::msg::PoseStamped & pose,
     const geometry_msgs::msg::Twist & feedback,
@@ -182,7 +183,12 @@ protected:
   const;
   double maximumTranslationalSpeed() const;
   double computeRegulatedSpeed(
-    const nav_msgs::msg::Path & path, const geometry_msgs::msg::Twist & speed, double pose_cost);
+    const nav_msgs::msg::Path & path, const geometry_msgs::msg::Twist & speed, double pose_cost,
+    const geometry_msgs::msg::PoseStamped & robot_pose);
+  // The path is relative to robot_pose, including virtual poses during prediction.
+  double applyRawCostConstraints(
+    const nav_msgs::msg::Path & local_plan,
+    const geometry_msgs::msg::PoseStamped & robot_pose, double input_speed);
   DynamicWindowBounds3D applyRegulationToDynamicWindow(
     const DynamicWindowBounds3D & physical_window, double regulated_speed) const;
   geometry_msgs::msg::Twist computeGoalVelocity(
@@ -262,6 +268,10 @@ protected:
   double max_accel_theta_ {2.0};
   double vp_translation_speed_ {0.0};
   double lateral_time_constant_ {0.0};
+  bool use_raw_cost_regulated_linear_velocity_scaling_ {false};
+  double raw_cost_lookahead_dist_ {0.0};
+  double raw_cost_sample_step_ {0.05};
+  double raw_cost_min_linear_velocity_ {0.1};
   double orientation_time_weight_ {1.0};
   double min_orientation_time_ {0.2};
   std::string velocity_feedback_ {"OPEN_LOOP"};

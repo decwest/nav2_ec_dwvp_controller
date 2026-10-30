@@ -315,7 +315,7 @@ ECDWVPController::PredictionResult ECDWVPController::predictTracking(
     step = computeControlStep(
       local_plan, goal, reference, command,
       collision_checker_->costAtPose(pose.pose.position.x, pose.pose.position.y),
-      context.yaw_tolerance);
+      context.yaw_tolerance, pose);
   }
   return result;
 }

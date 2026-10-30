@@ -55,6 +55,13 @@ path tangent, allowing sideways travel.
 The [configuration reference](docs/configuration.md) explains defaults, feedback,
 speed regulation, comparison modes, and logging. This branch targets Jazzy; `main` retains the Humble implementation.
 
+Optional raw cost regulation slows from the combined local costmap, including
+costs supplied by semantic layers. Set
+`use_raw_cost_regulated_linear_velocity_scaling: true` to enable it. See
+[raw cost settings and behavior](docs/configuration.md#raw-cost-regulation) for
+the sampling distance, speed mapping, and interaction with goal approach and
+closed-loop collision prediction. It is disabled by default.
+
 With `OPEN_LOOP`, path updates preserve the previous successful command, including
 changed endpoints, one-point stop paths and new goals during continuous control.
 Activation, reset/cancel, failed commands, invalid empty paths, or a command gap longer than
@@ -104,7 +111,8 @@ colcon test-result --verbose
 ```
 
 Tests cover command feasibility, Python/C++ numerical agreement, lifecycle behavior,
-collision projection, and plugin loading.
+collision projection, plugin loading, raw cost reduction, and agreement between
+prediction and successive control commands across spatial cost bands.
 
 See [Jazzy port verification](docs/jazzy_port.md) for interface changes, unchanged
 fixture hashes and the scope of local validation.

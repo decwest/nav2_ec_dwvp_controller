@@ -46,6 +46,10 @@ controller_server:
       transform_tolerance: 0.1
       use_regulated_linear_velocity_scaling: false  # PP curvature heuristic is not used
       use_cost_regulated_linear_velocity_scaling: true
+      use_raw_cost_regulated_linear_velocity_scaling: false  # true bypasses inflation-based scaling
+      raw_cost_lookahead_dist: 1.0  # meters along the path; 0 evaluates the current pose only
+      raw_cost_sample_step: 0.05
+      raw_cost_min_linear_velocity: 0.1  # floor for the regulated cap, not the command magnitude
       cost_scaling_dist: 0.6
       cost_scaling_gain: 1.0
       inflation_cost_scaling_factor: 3.0  # must match the costmap inflation layer

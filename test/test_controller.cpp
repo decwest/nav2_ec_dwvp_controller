@@ -308,25 +308,25 @@ TEST(Solver, HolonomicProjection)
 TEST_F(ControllerTest, CostApproachAndInheritedSpeedLimits)
 {
   ctrl.nominal(0.6);
-  EXPECT_DOUBLE_EQ(ctrl.computeRegulatedSpeed(path(2), twist(0, 0, 0), 0), 0.6);
+  EXPECT_DOUBLE_EQ(ctrl.computeRegulatedSpeed(path(2), twist(0, 0, 0), 0, pose), 0.6);
   ctrl.cost(true);
   const double radius = map->getLayeredCostmap()->getInscribedRadius();
   // Jazzy RPP reconstructs distance with the inscribed-obstacle cost (253).
   const double cost = nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE *
     std::exp(-3.0 * (0.4 - radius));
-  const double regulated = ctrl.computeRegulatedSpeed(path(2), twist(0, 0, 0), cost);
+  const double regulated = ctrl.computeRegulatedSpeed(path(2), twist(0, 0, 0), cost, pose);
   // Jazzy uses log(253.0f), so its inverse cost conversion has float precision.
   EXPECT_NEAR(regulated, 0.4, 1e-7);  // 0.6 nominal * 0.4 m / 0.6 m
   ctrl.approach(0.6);
-  EXPECT_NEAR(ctrl.computeRegulatedSpeed(path(0.3), twist(0, 0, 0), cost), 0.2, 1e-7);
+  EXPECT_NEAR(ctrl.computeRegulatedSpeed(path(0.3), twist(0, 0, 0), cost, pose), 0.2, 1e-7);
   ctrl.cost(false);
   ctrl.approach(0.0);
   ctrl.setSpeedLimit(0.2, false);
-  EXPECT_DOUBLE_EQ(ctrl.computeRegulatedSpeed(path(2), twist(0, 0, 0), 0), 0.2);
+  EXPECT_DOUBLE_EQ(ctrl.computeRegulatedSpeed(path(2), twist(0, 0, 0), 0, pose), 0.2);
   ctrl.setSpeedLimit(50, true);
-  EXPECT_DOUBLE_EQ(ctrl.computeRegulatedSpeed(path(2), twist(0, 0, 0), 0), 0.3);
+  EXPECT_DOUBLE_EQ(ctrl.computeRegulatedSpeed(path(2), twist(0, 0, 0), 0, pose), 0.3);
   ctrl.setSpeedLimit(nav2_costmap_2d::NO_SPEED_LIMIT, false);
-  EXPECT_DOUBLE_EQ(ctrl.computeRegulatedSpeed(path(2), twist(0, 0, 0), 0), 0.6);
+  EXPECT_DOUBLE_EQ(ctrl.computeRegulatedSpeed(path(2), twist(0, 0, 0), 0, pose), 0.6);
   EXPECT_THROW(ctrl.setSpeedLimit(-1, false), std::invalid_argument);
 }
 

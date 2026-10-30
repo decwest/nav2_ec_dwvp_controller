@@ -20,6 +20,10 @@ The values below are the plugin defaults when a setting is omitted.
 | `velocity_feedback` | `OPEN_LOOP` | Previous command or measured velocity (`CLOSED_LOOP`). |
 | `use_dynamic_window_vector_pursuit` | `true` | Select commands using the desired-velocity ray and dynamic window. |
 | `use_uniform_velocity_scaling` | `false` | Enable the Scaled VP comparison when dynamic-window selection is disabled. |
+| `use_raw_cost_regulated_linear_velocity_scaling` | `false` | Regulate the translation cap directly from combined local costmap values, replacing the inflation-distance heuristic. |
+| `raw_cost_lookahead_dist` | `0.0` | Path sampling distance [m] from the robot. Zero samples only the current position. |
+| `raw_cost_sample_step` | `0.05` | Distance [m] between raw cost samples. Must be positive. |
+| `raw_cost_min_linear_velocity` | `0.1` | Minimum raw-cost-regulated cap [m/s], limited to the incoming cap. This is not a minimum command speed. |
 | `use_collision_detection_for_omni` | `true` | Project the full holonomic motion when inherited collision checking is enabled. |
 | `collision_prediction_mode` | `constant_velocity` | Legacy command extrapolation, or `closed_loop` tracking prediction with a stopping-distance governor. |
 | `collision_prediction_time_buffer` | `2.0` | Extra prediction time [s] after the maximum configured or observed stopping time; closed-loop mode only. |
@@ -33,6 +37,8 @@ The values below are the plugin defaults when a setting is omitted.
 The velocity intervals must contain zero, and acceleration limits must be positive.
 Package-specific parameters are read during lifecycle configuration, so reconfigure
 the controller after changing them.
+Raw cost distances and minimum velocity must be finite and nonnegative, and the
+sample step must be finite and positive. Invalid values reject configuration.
 
 ## Lateral response and preview
 
@@ -90,6 +96,66 @@ settings are `cost_scaling_dist`, `cost_scaling_gain`,
 Keep `approach_velocity_scaling_dist` positive to slow near the goal. The example
 uses 0.6 m. Inside the position tolerance, terminal control brakes translation and
 aligns with the final path yaw. Position and yaw tolerances come from the goal checker.
+
+### Raw cost regulation
+
+To slow directly from the combined local costmap, enable raw cost regulation under
+the controller ID (including nested IDs such as `FollowPath.primary_controller`):
+
+```yaml
+use_raw_cost_regulated_linear_velocity_scaling: true
+raw_cost_lookahead_dist: 1.0
+raw_cost_sample_step: 0.05
+raw_cost_min_linear_velocity: 0.1
+```
+
+When enabled, the controller bypasses RPP's inflation-distance cost heuristic,
+even if `use_cost_regulated_linear_velocity_scaling` is true. Goal-approach
+regulation and Nav2 speed limits still apply. The order is nominal cap, goal
+approach, raw cost reduction, then the existing x/y window contraction and command
+selection. Disabling raw cost regulation preserves the inherited behavior.
+
+Sampling starts at the robot origin, follows the segment to the first local path
+point, and continues along the path up to `raw_cost_lookahead_dist`. Sparse path
+segments are interpolated; duplicate points do not add distance. As in
+`nav2_raw_cost_rpp_controller`, the path endpoint and horizon are not added as
+extra samples if they fall between sampling intervals. A step larger than the
+horizon samples the horizon once; steps at or below 1e-6 m use the horizon as the
+step. An empty or shorter-than-one-step path contributes only the robot origin.
+
+The largest sampled cost other than `FREE_SPACE` (0) and `NO_INFORMATION` (255)
+sets the reduction. `LETHAL_OBSTACLE` (254) is capped at 253 for this calculation:
+
+```text
+v = cap after goal-approach regulation
+min_v = min(v, raw_cost_min_linear_velocity)
+v_reg = v - (v - min_v) * min(cost, 253) / 253.0
+```
+
+Out-of-map samples are skipped. If the robot pose cannot be transformed into the
+costmap frame, or no regulating cost is found, this stage leaves the incoming cap
+unchanged. It does not fall back to the inflation-distance heuristic. Collision
+checking remains separate and can reject a command even when this stage returns
+a positive cap. In particular, unknown and lethal cells retain their existing
+collision-checker treatment.
+
+The regulated cap contracts the axis velocity bounds; it is not a lower bound on
+the command magnitude. For equal x/y limits, an axis-aligned command can be as low
+as `v_reg / sqrt(2)` even without acceleration or goal constraints. After a sudden
+cost increase, acceleration limits can also require several cycles to reach the
+new cap. Terminal rotation and collision braking retain their existing behavior.
+
+The lateral compensation demand continues to use
+`lateral_time_constant * demand_speed` as its response distance. Raw cost reduction
+does not recompute that demand, so the realized lateral convergence can take
+longer while moving slowly. The existing feasible-command selection still
+determines whether the desired velocity direction can be maintained.
+
+Closed-loop prediction samples the same frozen costmap from each virtual robot
+pose, including that pose's orientation, using the same reduction as actual control.
+These are path-point samples, not a swept footprint evaluation. Semantic layers
+remain responsible for converting attributes to cost values; the controller has
+no semantic-layer dependency and cannot distinguish the sources of combined costs.
 
 ## Comparison modes
 

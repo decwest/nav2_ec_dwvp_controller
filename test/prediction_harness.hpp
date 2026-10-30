@@ -26,6 +26,8 @@ public:
   using ECDWVPController::stoppingTime;
   using ECDWVPController::sweptSpeed;
   using ECDWVPController::isCollisionImminentOmni;
+  using ECDWVPController::applyRawCostConstraints;
+  using ECDWVPController::computeRegulatedSpeed;
 
   void enable(bool value) {params_->use_collision_detection = value;}
   const std::string & mode() const {return collision_prediction_mode_;}
@@ -33,6 +35,21 @@ public:
   void goalTolerance(double value) {goal_dist_tol_ = value;}
   void compensation(double value) {lateral_time_constant_ = value;}
   void costRegulation(bool value) {params_->use_cost_regulated_linear_velocity_scaling = value;}
+  bool costRegulationEnabled() const {return params_->use_cost_regulated_linear_velocity_scaling;}
+  void rawCostRegulation(
+    bool value, double distance = 0.0, double step = 0.05,
+    double minimum = 0.1)
+  {
+    use_raw_cost_regulated_linear_velocity_scaling_ = value;
+    raw_cost_lookahead_dist_ = distance;
+    raw_cost_sample_step_ = step;
+    raw_cost_min_linear_velocity_ = minimum;
+  }
+  auto rawCostSettings() const
+  {
+    return std::make_tuple(use_raw_cost_regulated_linear_velocity_scaling_,
+      raw_cost_lookahead_dist_, raw_cost_sample_step_, raw_cost_min_linear_velocity_);
+  }
   void approachRegulation(double value) {params_->approach_velocity_scaling_dist = value;}
   size_t pathSize() {return path_handler_->getPlan().poses.size();}
   bool commandValid() const {return last_command_valid_;}
@@ -66,7 +83,8 @@ public:
     }
     return computeControlStep(
       local, goal, reference, feedback,
-      collision_checker_->costAtPose(pose.pose.position.x, pose.pose.position.y), yaw_tolerance);
+      collision_checker_->costAtPose(pose.pose.position.x, pose.pose.position.y), yaw_tolerance,
+      pose);
   }
 };
 

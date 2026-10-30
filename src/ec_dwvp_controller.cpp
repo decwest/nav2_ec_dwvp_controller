@@ -7,6 +7,7 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 #include "nav2_ec_dwvp_controller/ec_dwvp_controller.hpp"
+#include "nav2_ec_dwvp_controller/raw_cost_heuristics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -29,6 +30,7 @@
 #include "nav2_util/robot_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "tf2/utils.hpp"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
 namespace rpp = nav2_regulated_pure_pursuit_controller;
 
@@ -68,6 +70,28 @@ void ECDWVPController::configure(
   declare_parameter_if_not_declared(
     node.get(), name + ".lateral_time_constant", rclcpp::ParameterValue(0.0));
   node->get_parameter(name + ".lateral_time_constant", lateral_time_constant_);
+
+  declare_parameter_if_not_declared(
+    node.get(), name + ".use_raw_cost_regulated_linear_velocity_scaling",
+    rclcpp::ParameterValue(false));
+  declare_parameter_if_not_declared(
+    node.get(), name + ".raw_cost_lookahead_dist", rclcpp::ParameterValue(0.0));
+  declare_parameter_if_not_declared(
+    node.get(), name + ".raw_cost_sample_step", rclcpp::ParameterValue(0.05));
+  declare_parameter_if_not_declared(
+    node.get(), name + ".raw_cost_min_linear_velocity", rclcpp::ParameterValue(0.1));
+  node->get_parameter(
+    name + ".use_raw_cost_regulated_linear_velocity_scaling",
+    use_raw_cost_regulated_linear_velocity_scaling_);
+  node->get_parameter(name + ".raw_cost_lookahead_dist", raw_cost_lookahead_dist_);
+  node->get_parameter(name + ".raw_cost_sample_step", raw_cost_sample_step_);
+  node->get_parameter(name + ".raw_cost_min_linear_velocity", raw_cost_min_linear_velocity_);
+  if (!std::isfinite(raw_cost_lookahead_dist_) || raw_cost_lookahead_dist_ < 0.0 ||
+    !std::isfinite(raw_cost_sample_step_) || raw_cost_sample_step_ <= 0.0 ||
+    !std::isfinite(raw_cost_min_linear_velocity_) || raw_cost_min_linear_velocity_ < 0.0)
+  {
+    throw std::invalid_argument("Invalid raw cost lookahead, sample step or minimum velocity");
+  }
 
   declare_parameter_if_not_declared(
     node.get(), name + ".max_vel_x",
@@ -712,7 +736,7 @@ double ECDWVPController::maximumTranslationalSpeed() const
 
 double ECDWVPController::computeRegulatedSpeed(
   const nav_msgs::msg::Path & path, const geometry_msgs::msg::Twist & speed,
-  double pose_cost)
+  double pose_cost, const geometry_msgs::msg::PoseStamped & robot_pose)
 {
   const double nominal = std::min(maximumTranslationalSpeed(), params_->desired_linear_vel);
   if (!std::isfinite(nominal) || nominal < 0.0) {
@@ -720,9 +744,67 @@ double ECDWVPController::computeRegulatedSpeed(
   }
   double regulated = nominal;
   double sign = 1.0;
-  // Zero curvature excludes the nonholonomic PP curvature heuristic.
-  applyConstraints(0.0, speed, pose_cost, path, regulated, sign);
-  return std::clamp(regulated, 0.0, nominal);
+  {
+    // Restore the inherited setting even if constraint evaluation throws.
+    struct RestoreCostScaling
+    {
+      bool & setting;
+      const bool original;
+      ~RestoreCostScaling() {setting = original;}
+    } restore {params_->use_cost_regulated_linear_velocity_scaling,
+      params_->use_cost_regulated_linear_velocity_scaling};
+    if (use_raw_cost_regulated_linear_velocity_scaling_) {
+      params_->use_cost_regulated_linear_velocity_scaling = false;
+    }
+    // Zero curvature excludes the nonholonomic PP curvature heuristic.
+    applyConstraints(0.0, speed, pose_cost, path, regulated, sign);
+  }
+  return applyRawCostConstraints(path, robot_pose, std::clamp(regulated, 0.0, nominal));
+}
+
+double ECDWVPController::applyRawCostConstraints(
+  const nav_msgs::msg::Path & local_plan,
+  const geometry_msgs::msg::PoseStamped & robot_pose, double input_speed)
+{
+  if (!use_raw_cost_regulated_linear_velocity_scaling_ || input_speed == 0.0) {
+    return input_speed;
+  }
+
+  auto map_pose = robot_pose;
+  const auto map_frame = costmap_ros_->getGlobalFrameID();
+  if (map_pose.header.frame_id != map_frame) {
+    try {
+      map_pose = tf_->transform(
+        robot_pose, map_frame, tf2::durationFromSec(params_->transform_tolerance));
+    } catch (const tf2::TransformException & error) {
+      RCLCPP_DEBUG(logger_, "Skipping raw cost samples: %s", error.what());
+      return input_speed;
+    }
+  }
+
+  const double yaw = tf2::getYaw(map_pose.pose.orientation);
+  const double cosine = std::cos(yaw);
+  const double sine = std::sin(yaw);
+  const auto samples = raw_cost_heuristics::sampleReferencePath(
+    local_plan, raw_cost_lookahead_dist_, raw_cost_sample_step_);
+  unsigned char max_cost = nav2_costmap_2d::FREE_SPACE;
+  for (const auto & sample : samples) {
+    const auto & p = sample.pose.position;
+    // Use this control step's pose, never the live base_link transform: the
+    // local path may belong to a future virtual robot in closed-loop prediction.
+    const double x = map_pose.pose.position.x + cosine * p.x - sine * p.y;
+    const double y = map_pose.pose.position.y + sine * p.x + cosine * p.y;
+    unsigned int mx, my;
+    if (!std::isfinite(x) || !std::isfinite(y) || !costmap_->worldToMap(x, y, mx, my)) {
+      continue;
+    }
+    const auto cost = costmap_->getCost(mx, my);
+    if (raw_cost_heuristics::isCostRegulating(cost)) {
+      max_cost = std::max(max_cost, cost);
+    }
+  }
+  return raw_cost_heuristics::rawCostConstraint(
+    input_speed, max_cost, raw_cost_min_linear_velocity_);
 }
 
 ECDWVPController::DynamicWindowBounds3D
@@ -1146,7 +1228,8 @@ ECDWVPController::ControlStep ECDWVPController::computeControlStep(
   const nav_msgs::msg::Path & transformed_plan,
   const geometry_msgs::msg::PoseStamped & final_goal,
   const ReferenceProjection & reference, const geometry_msgs::msg::Twist & feedback_speed,
-  double pose_cost, double yaw_tolerance)
+  double pose_cost, double yaw_tolerance,
+  const geometry_msgs::msg::PoseStamped & robot_pose)
 {
   const double lookahead_dist = getLookAheadDistanceOmni(feedback_speed);
   const auto preview = computePreviewTarget(transformed_plan, lookahead_dist);
@@ -1171,7 +1254,7 @@ ECDWVPController::ControlStep ECDWVPController::computeControlStep(
     carrot_pose, lookahead_yaw, &reference, goal_region, nearest_target, &response);
   const double regulated_speed = computeRegulatedSpeed(
     transformed_plan, feedback_speed,
-    pose_cost);
+    pose_cost, robot_pose);
   const DynamicWindowBounds3D dynamic_window = computeDynamicWindow(feedback_speed);
 
   const auto regulated_window = applyRegulationToDynamicWindow(dynamic_window, regulated_speed);
@@ -1267,7 +1350,8 @@ geometry_msgs::msg::TwistStamped ECDWVPController::computeVelocityCommands(
     goal_checker ? std::abs(tf2::getYaw(pose_tolerance.orientation)) : 0.0;
   const auto step = computeControlStep(
     transformed_plan, final_goal, reference, feedback_speed,
-    collision_checker_->costAtPose(pose.pose.position.x, pose.pose.position.y), yaw_tolerance);
+    collision_checker_->costAtPose(pose.pose.position.x, pose.pose.position.y), yaw_tolerance,
+      pose);
   const auto & carrot_pose = step.preview.pose;
   carrot_pub_->publish(createCarrotMsg(carrot_pose));
   auto cmd_twist = step.command;
